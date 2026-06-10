@@ -70,6 +70,8 @@ std::string keyConv(const T& t)
 class LMDBBackend : public DNSBackend
 {
 public:
+  static constexpr unsigned int CurrentSchemaVersion{6};
+
   explicit LMDBBackend(const string& suffix = "");
   ~LMDBBackend();
 
@@ -79,6 +81,12 @@ public:
 
   bool getDomainInfo(const ZoneName& domain, DomainInfo& info, bool getserial = true) override;
   bool createDomain(const ZoneName& domain, const DomainInfo::DomainKind kind, const vector<ComboAddress>& primaries, const string& account) override;
+  bool replaceDomainInfo(const DomainInfo& info);
+  void replaceDomainMetadata(const ZoneName& name, const std::map<std::string, std::vector<std::string>>& meta);
+  void replaceDomainKeys(const ZoneName& name, const std::vector<KeyData>& keys, bool skipInvalid = false);
+  void replaceTSIGKeys(const std::vector<TSIGKey>& keys);
+  void deleteDomainCommentsInTransaction(domainid_t domain_id);
+  void sync();
 
   bool startTransaction(const ZoneName& domain, domainid_t domain_id = UnknownDomainID) override;
   bool commitTransaction() override;
@@ -354,6 +362,7 @@ private:
   bool genChangeDomain(domainid_t id, const std::function<void(DomainInfo&)>& func);
   bool genChangeTransientDomain(domainid_t id, const std::function<void(DomainInfo&)>& func);
   static void deleteDomainRecords(RecordsRWTransaction& txn, const std::string& match, QType qtype = QType::ANY);
+  static void deleteDomainComments(RecordsRWTransaction& txn, const std::string& match);
 
   bool findDomain(const ZoneName& domain, DomainInfo& info) const;
   bool findDomain(domainid_t domainid, DomainInfo& info) const;

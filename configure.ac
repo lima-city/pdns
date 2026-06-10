@@ -247,6 +247,8 @@ AM_CONDITIONAL([SQLITE3], [test "x$needsqlite3" = "xyes"])
 
 AM_CONDITIONAL([LMDB], [test "x$needlmdb" != "x"])
 AM_CONDITIONAL([HAVE_LMDB], [test "x$LMDB_LIBS" != "x"])
+AM_CONDITIONAL([MYSQL], [test "x$MYSQL_LIBS" != "x"])
+AM_CONDITIONAL([PDNS_MYSQL2LMDB], [test "x$MYSQL_LIBS" != "x" -a "x$LMDB_LIBS" != "x"])
 
 AS_IF([test "x$needlmdb" = "xyes"], [
   AS_IF([test "$with_lmdb" = "no"], [

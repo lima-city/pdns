@@ -63,3 +63,5 @@ compile_commands.*
 .venv
 sphinx.stamp
 sphinx.d
+pdns-mysql2lmdb.state
+pdns-repl.lmdb*

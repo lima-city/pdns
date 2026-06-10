@@ -13,7 +13,15 @@ if get_option('module-gmysql') != 'disabled'
     endif
 
     mysql_cflags_res = run_command(mysql_config, '--cflags', check: true)
-    mysql_cflags = mysql_cflags_res.stdout().strip().split()
+    mysql_cflags = []
+    foreach flag: mysql_cflags_res.stdout().strip().split()
+      # Some mysql_config variants still emit very old C++ ABI flags.  Applying
+      # those project-wide breaks modern libstdc++ headers, so keep only flags
+      # that are safe for consumers of mysql.h.
+      if not flag.startswith('-fabi-version=')
+        mysql_cflags += flag
+      endif
+    endforeach
 
     mysql_ldflags_res = run_command(mysql_config, '--libs', check: true)
     mysql_ldflags = mysql_ldflags_res.stdout().strip().split()

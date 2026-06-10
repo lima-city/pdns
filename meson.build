@@ -727,6 +727,20 @@ tools = {
   },
 }
 
+if get_option('module-gmysql') != 'disabled' and get_option('module-lmdb') != 'disabled'
+  tools += {
+    'pdns-mysql2lmdb': {
+      'main': src_dir / 'mysql2lmdb.cc',
+      'deps-extra': [
+        module_lmdbbackend_lib,
+        libpdns_signers_openssl,
+        libpdns_signers_sodium,
+      ],
+      'manpages': ['pdns-mysql2lmdb.1'],
+    },
+  }
+endif
+
 if get_option('module-ldap') != 'disabled'
   tools += {
     'zone2ldap': {

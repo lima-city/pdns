@@ -254,6 +254,13 @@ MDBDbi MDBEnv::openDB(const string_view dbname, int flags)
   return ret;
 }
 
+void MDBEnv::sync(bool force)
+{
+  if (int ret = mdb_env_sync(d_env, force ? 1 : 0); ret != 0) {
+    throw std::runtime_error("Unable to sync mdb environment: " + MDBError(ret));
+  }
+}
+
 MDBRWTransactionImpl::MDBRWTransactionImpl(MDBEnv *parent, MDB_txn *txn):
   MDBROTransactionImpl(parent, txn)
 

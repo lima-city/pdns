@@ -159,6 +159,11 @@ struct LMDBIndexOps
     txn->del(d_idx, combined);
   }
 
+  void rawClear(MDBRWTransaction& txn)
+  {
+    txn->clear(d_idx);
+  }
+
   void openDB(std::shared_ptr<MDBEnv>& env, string_view str, int flags)
   {
     d_idx = env->openDB(str, flags);
@@ -208,6 +213,9 @@ struct nullindex_t
   {}
   template <typename Class>
   void del(MDBRWTransaction& /* txn */, const Class& /* t */, uint32_t /* id */)
+  {}
+
+  void rawClear(MDBRWTransaction& /* txn */)
   {}
 
   void openDB(std::shared_ptr<MDBEnv>& /* env */, string_view /* str */, int /* flags */)
@@ -832,6 +840,16 @@ public:
       }
     }
 
+    //! clear database & indexes without deserializing existing values
+    void rawClear()
+    {
+      (*d_txn)->clear(d_parent->d_main);
+      rawClearIndex<0>();
+      rawClearIndex<1>();
+      rawClearIndex<2>();
+      rawClearIndex<3>();
+    }
+
     //! commit this transaction
     void commit()
     {
@@ -856,6 +874,12 @@ public:
     inline auto clear(const T& value, uint32_t itemId)
     {
       std::get<N>(d_parent->d_tuple).del(*d_txn, value, itemId);
+    }
+
+    template <uint8_t N>
+    inline auto rawClearIndex()
+    {
+      std::get<N>(d_parent->d_tuple).rawClear(*d_txn);
     }
 
     // clear this ID from all indexes

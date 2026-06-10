@@ -62,6 +62,7 @@ EXTRA_DIST = \
 	lua-record.cc \
 	minicurl.cc \
 	minicurl.hh \
+	mysql2lmdb.cc \
 	named.conf.parsertest \
 	pdns.service.meson.in \
 	pdns.service.in \

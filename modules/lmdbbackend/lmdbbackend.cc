@@ -57,7 +57,7 @@
 #include <systemd/sd-daemon.h>
 #endif
 
-constexpr unsigned int SCHEMAVERSION{6};
+constexpr unsigned int SCHEMAVERSION{LMDBBackend::CurrentSchemaVersion};
 
 // List the class version here. Default is 0
 BOOST_CLASS_VERSION(LMDBBackend::KeyDataDB, 1)
@@ -1301,6 +1301,19 @@ void LMDBBackend::deleteDomainRecords(RecordsRWTransaction& txn, const std::stri
   }
 }
 
+void LMDBBackend::deleteDomainComments(RecordsRWTransaction& txn, const std::string& match)
+{
+  auto cursor = txn.txn->getCursor(txn.db->cdbi);
+  MDBOutVal key{};
+  MDBOutVal val{};
+
+  if (cursor.prefix(match, key, val) == 0) {
+    do {
+      cursor.del(key);
+    } while (cursor.next(key, val) == 0);
+  }
+}
+
 bool LMDBBackend::findDomain(const ZoneName& domain, DomainInfo& info) const
 {
   auto rotxn = d_tdomains->getROTransaction();
@@ -1424,6 +1437,15 @@ bool LMDBBackend::startTransaction(const ZoneName& domain, domainid_t domain_id)
   }
 
   return true;
+}
+
+void LMDBBackend::deleteDomainCommentsInTransaction(domainid_t domain_id)
+{
+  if (!d_rwtxn) {
+    throw DBException("Attempt to delete domain comments while no transaction was open");
+  }
+  compoundOrdername order;
+  LMDBBackend::deleteDomainComments(*d_rwtxn, order(domain_id));
 }
 
 bool LMDBBackend::commitTransaction()
@@ -1954,14 +1976,13 @@ std::shared_ptr<LMDBBackend::RecordsROTransaction> LMDBBackend::getRecordsROTran
 
 bool LMDBBackend::deleteDomain(const ZoneName& domain)
 {
-  if (!d_rwtxn) {
-    throw DBException(std::string(__PRETTY_FUNCTION__) + " called without a transaction");
-  }
-
+  bool hadTransaction = static_cast<bool>(d_rwtxn);
   int transactionDomainId = d_transactiondomainid;
   ZoneName transactionDomain = d_transactiondomain;
 
-  abortTransaction();
+  if (d_rwtxn) {
+    abortTransaction();
+  }
 
   LmdbIdVec idvec;
 
@@ -2024,7 +2045,9 @@ bool LMDBBackend::deleteDomain(const ZoneName& domain)
     txn.commit();
   }
 
-  startTransaction(transactionDomain, transactionDomainId);
+  if (hadTransaction) {
+    startTransaction(transactionDomain, transactionDomainId);
+  }
 
   return true;
 }
@@ -2476,6 +2499,100 @@ bool LMDBBackend::createDomain(const ZoneName& domain, const DomainInfo::DomainK
   }
 
   return true;
+}
+
+bool LMDBBackend::replaceDomainInfo(const DomainInfo& replacement)
+{
+  DomainInfo info;
+  if (!findDomain(replacement.zone, info)) {
+    return false;
+  }
+
+  info.kind = replacement.kind;
+  info.primaries = replacement.primaries;
+  info.account = replacement.account;
+  info.options = replacement.options;
+  info.catalog = replacement.catalog;
+  info.last_check = replacement.last_check;
+  info.notified_serial = replacement.notified_serial;
+
+  {
+    auto txn = d_tdomains->getRWTransaction();
+    txn.put(info, info.id);
+    txn.commit();
+  }
+  writeTransientDomainInfo(info);
+  return true;
+}
+
+void LMDBBackend::replaceDomainMetadata(const ZoneName& name, const std::map<std::string, std::vector<std::string>>& meta)
+{
+  auto txn = d_tmeta->getRWTransaction();
+  LmdbIdVec ids;
+  txn.get_multi<0>(name, ids);
+
+  for (auto id : ids) {
+    txn.del(id);
+  }
+
+  for (const auto& [kind, values] : meta) {
+    for (const auto& value : values) {
+      DomainMeta dm{name, kind, value};
+      txn.put(dm, 0, d_random_ids, burtleCI(kind, name.hash()));
+    }
+  }
+  txn.commit();
+}
+
+void LMDBBackend::replaceDomainKeys(const ZoneName& name, const std::vector<KeyData>& keys, bool skipInvalid)
+{
+  auto txn = d_tkdb->getRWTransaction();
+  LmdbIdVec ids;
+  txn.get_multi<0>(name, ids);
+
+  for (auto id : ids) {
+    txn.del(id);
+  }
+
+  for (const auto& key : keys) {
+    KeyDataDB kdb{name, key.content, key.flags, key.active, key.published};
+
+    try {
+      DNSKEYRecordContent dkrc;
+      auto keyEngine = shared_ptr<DNSCryptoKeyEngine>(DNSCryptoKeyEngine::makeFromISCString(d_slog, dkrc, key.content));
+      DNSSECPrivateKey dpk;
+      dpk.setKey(keyEngine, key.flags);
+      auto tag = dpk.getDNSKEY().getTag();
+
+      txn.put(kdb, 0, d_random_ids, name.hash(tag));
+    }
+    catch (...) {
+      if (!skipInvalid) {
+        throw;
+      }
+    }
+  }
+  txn.commit();
+}
+
+void LMDBBackend::replaceTSIGKeys(const std::vector<TSIGKey>& keys)
+{
+  auto txn = d_ttsig->getRWTransaction();
+  txn.rawClear();
+  for (const auto& key : keys) {
+    txn.put(key, 0, d_random_ids, key.name.hash());
+  }
+  txn.commit();
+}
+
+void LMDBBackend::sync()
+{
+  d_tdomains->getEnv()->sync(true);
+  for (const auto& shard : d_trecords) {
+    if (shard.env) {
+      shard.env->sync(true);
+    }
+  }
 }
 
 void LMDBBackend::getAllDomainsFiltered(vector<DomainInfo>* domains, const std::function<bool(DomainInfo&)>& allow)

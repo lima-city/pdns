@@ -100,6 +100,7 @@ public:
 
   MDBRWTransaction getRWTransaction();
   MDBROTransaction getROTransaction();
+  void sync(bool force = true);
 
   operator MDB_env*& ()
   {
