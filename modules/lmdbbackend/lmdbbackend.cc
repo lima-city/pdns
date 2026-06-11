@@ -1977,10 +1977,12 @@ std::shared_ptr<LMDBBackend::RecordsROTransaction> LMDBBackend::getRecordsROTran
 bool LMDBBackend::deleteDomain(const ZoneName& domain)
 {
   bool hadTransaction = static_cast<bool>(d_rwtxn);
-  int transactionDomainId = d_transactiondomainid;
-  ZoneName transactionDomain = d_transactiondomain;
+  domainid_t transactionDomainId = UnknownDomainID;
+  ZoneName transactionDomain;
 
-  if (d_rwtxn) {
+  if (hadTransaction) {
+    transactionDomainId = d_transactiondomainid;
+    transactionDomain = d_transactiondomain;
     abortTransaction();
   }
 
@@ -2006,6 +2008,7 @@ bool LMDBBackend::deleteDomain(const ZoneName& domain)
   for (auto id : idvec) {
 
     startTransaction(domain, id);
+    deleteDomainCommentsInTransaction(id);
 
     { // Remove metadata
       auto txn = d_tmeta->getRWTransaction();
@@ -2554,6 +2557,7 @@ void LMDBBackend::replaceDomainKeys(const ZoneName& name, const std::vector<KeyD
     txn.del(id);
   }
 
+  size_t importedKeys = 0;
   for (const auto& key : keys) {
     KeyDataDB kdb{name, key.content, key.flags, key.active, key.published};
 
@@ -2565,12 +2569,23 @@ void LMDBBackend::replaceDomainKeys(const ZoneName& name, const std::vector<KeyD
       auto tag = dpk.getDNSKEY().getTag();
 
       txn.put(kdb, 0, d_random_ids, name.hash(tag));
+      ++importedKeys;
+    }
+    catch (const std::exception& e) {
+      if (!skipInvalid) {
+        throw;
+      }
+      g_log << Logger::Warning << "Skipping invalid DNSSEC key for zone '" << name.toLogString() << "' key id " << key.id << ": " << e.what() << endl;
     }
     catch (...) {
       if (!skipInvalid) {
         throw;
       }
+      g_log << Logger::Warning << "Skipping invalid DNSSEC key for zone '" << name.toLogString() << "' key id " << key.id << ": unknown error" << endl;
     }
+  }
+  if (skipInvalid && !ids.empty() && !keys.empty() && importedKeys == 0) {
+    throw DBException("Refusing to replace all DNSSEC keys for previously signed zone '" + name.toLogString() + "' with zero valid keys");
   }
   txn.commit();
 }
@@ -2578,7 +2593,7 @@ void LMDBBackend::replaceDomainKeys(const ZoneName& name, const std::vector<KeyD
 void LMDBBackend::replaceTSIGKeys(const std::vector<TSIGKey>& keys)
 {
   auto txn = d_ttsig->getRWTransaction();
-  txn.rawClear();
+  txn.clear();
   for (const auto& key : keys) {
     txn.put(key, 0, d_random_ids, key.name.hash());
   }

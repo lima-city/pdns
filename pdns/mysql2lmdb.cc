@@ -741,6 +741,31 @@ int64_t optInt(const std::vector<std::optional<std::string>>& row, size_t index,
   return std::stoll(value);
 }
 
+bool skipInvalidRecords()
+{
+  return getArg("invalid-records") == "skip";
+}
+
+bool handleInvalidSourceData(const std::string& message)
+{
+  if (skipInvalidRecords()) {
+    logWarning("skipping " + message);
+    return true;
+  }
+  throw std::runtime_error(message + "; fix the source data or set --invalid-records=skip");
+}
+
+std::optional<ZoneName> parseZoneNameFromSource(const std::string& value, const std::string& context)
+{
+  try {
+    return ZoneName(value);
+  }
+  catch (const std::exception& e) {
+    handleInvalidSourceData("Invalid MySQL zone name " + context + " value='" + value + "': " + e.what());
+    return std::nullopt;
+  }
+}
+
 class RecordDomainMap
 {
 public:
@@ -759,6 +784,7 @@ public:
 
   void replaceDomain(domainid_t domainID, const std::vector<MySQLRecord>& records)
   {
+    forgetDomain(domainID);
     for (const auto& record : records) {
       remember(record.id, domainID);
     }
@@ -843,35 +869,18 @@ std::vector<ComboAddress> parsePrimaries(const std::string& master)
   return primaries;
 }
 
-std::optional<MySQLDomain> findDomainByName(MySQL& mysql, const ZoneName& zone)
+std::optional<MySQLDomain> parseDomainRow(const std::vector<std::optional<std::string>>& row, const std::string& context)
 {
-  const auto rows = mysql.query("SELECT id,name,master,last_check,type,notified_serial,account,options,catalog FROM domains WHERE name=" + sqlString(mysql, zone.toStringNoDot()));
-  if (rows.empty()) {
-    return std::nullopt;
-  }
-  const auto& row = rows.at(0);
   MySQLDomain domain;
   domain.id = static_cast<domainid_t>(optInt(row, 0));
-  domain.name = ZoneName(optString(row, 1));
-  domain.master = optString(row, 2);
-  domain.lastCheck = static_cast<time_t>(optInt(row, 3));
-  domain.kind = DomainInfo::stringToKind(optString(row, 4));
-  domain.notifiedSerial = normalizeOptionalUInt32(optString(row, 5), "notified_serial", "for zone '" + domain.name.toLogString() + "'");
-  domain.account = optString(row, 6);
-  domain.options = optString(row, 7);
-  if (!optString(row, 8).empty()) {
-    domain.catalog = ZoneName(optString(row, 8));
-  }
-  return domain;
-}
+  const auto rawName = optString(row, 1);
 
-std::vector<MySQLDomain> getDomains(MySQL& mysql)
-{
-  std::vector<MySQLDomain> domains;
-  for (const auto& row : mysql.query("SELECT id,name,master,last_check,type,notified_serial,account,options,catalog FROM domains ORDER BY id")) {
-    MySQLDomain domain;
-    domain.id = static_cast<domainid_t>(optInt(row, 0));
-    domain.name = ZoneName(optString(row, 1));
+  try {
+    const auto name = parseZoneNameFromSource(rawName, context + " id=" + std::to_string(domain.id));
+    if (!name) {
+      return std::nullopt;
+    }
+    domain.name = *name;
     domain.master = optString(row, 2);
     domain.lastCheck = static_cast<time_t>(optInt(row, 3));
     domain.kind = DomainInfo::stringToKind(optString(row, 4));
@@ -879,9 +888,37 @@ std::vector<MySQLDomain> getDomains(MySQL& mysql)
     domain.account = optString(row, 6);
     domain.options = optString(row, 7);
     if (!optString(row, 8).empty()) {
-      domain.catalog = ZoneName(optString(row, 8));
+      const auto catalog = parseZoneNameFromSource(optString(row, 8), context + " catalog for zone '" + domain.name.toLogString() + "'");
+      if (!catalog) {
+        return std::nullopt;
+      }
+      domain.catalog = *catalog;
     }
-    domains.emplace_back(std::move(domain));
+  }
+  catch (const std::exception& e) {
+    handleInvalidSourceData("Invalid MySQL domain row " + context + " id=" + std::to_string(domain.id) + " name='" + rawName + "': " + e.what());
+    return std::nullopt;
+  }
+
+  return domain;
+}
+
+std::optional<MySQLDomain> findDomainByName(MySQL& mysql, const ZoneName& zone)
+{
+  const auto rows = mysql.query("SELECT id,name,master,last_check,type,notified_serial,account,options,catalog FROM domains WHERE name=" + sqlString(mysql, zone.toStringNoDot()));
+  if (rows.empty()) {
+    return std::nullopt;
+  }
+  return parseDomainRow(rows.at(0), "from domains lookup");
+}
+
+std::vector<MySQLDomain> getDomains(MySQL& mysql)
+{
+  std::vector<MySQLDomain> domains;
+  for (const auto& row : mysql.query("SELECT id,name,master,last_check,type,notified_serial,account,options,catalog FROM domains ORDER BY id")) {
+    if (auto domain = parseDomainRow(row, "during full resync")) {
+      domains.emplace_back(std::move(*domain));
+    }
   }
   return domains;
 }
@@ -901,6 +938,9 @@ std::vector<MySQLRecord> getRecords(MySQL& mysql, const MySQLDomain& domain)
     try {
       record.rr.domain_id = domain.id;
       record.rr.qname = DNSName(record.sourceName);
+      if (!record.rr.qname.isPartOf(domain.name)) {
+        throw std::runtime_error("record name is outside the zone");
+      }
       record.rr.auth = optInt(row, 8, 1) != 0;
       if (record.sourceType.empty()) {
         record.isENT = true;
@@ -921,11 +961,9 @@ std::vector<MySQLRecord> getRecords(MySQL& mysql, const MySQLDomain& domain)
     }
     catch (const std::exception& e) {
       const auto message = "Invalid MySQL record id " + std::to_string(record.id) + " in zone '" + domain.name.toLogString() + "' name='" + record.sourceName + "' type='" + record.sourceType + "': " + e.what();
-      if (getArg("invalid-records") == "skip") {
-        logWarning("skipping " + message);
+      if (handleInvalidSourceData(message)) {
         continue;
       }
-      throw std::runtime_error(message + "; fix the source data or set --invalid-records=skip");
     }
     records.emplace_back(std::move(record));
   }
@@ -987,12 +1025,25 @@ std::vector<MySQLComment> getComments(MySQL& mysql, const MySQLDomain& domain)
   const auto rows = mysql.query("SELECT name,type,modified_at,account,comment FROM comments WHERE domain_id=" + std::to_string(domain.id) + " ORDER BY id");
   for (const auto& row : rows) {
     MySQLComment entry;
-    entry.comment.domain_id = domain.id;
-    entry.comment.qname = DNSName(optString(row, 0));
-    entry.comment.qtype = QType(QType::chartocode(optString(row, 1).c_str()));
-    entry.comment.modified_at = static_cast<time_t>(optInt(row, 2));
-    entry.comment.account = optString(row, 3);
-    entry.comment.content = optString(row, 4);
+    const auto sourceName = optString(row, 0);
+    const auto sourceType = optString(row, 1);
+    try {
+      entry.comment.domain_id = domain.id;
+      entry.comment.qname = DNSName(sourceName);
+      if (!entry.comment.qname.isPartOf(domain.name)) {
+        throw std::runtime_error("comment name is outside the zone");
+      }
+      entry.comment.qtype = QType(QType::chartocode(sourceType.c_str()));
+      entry.comment.modified_at = static_cast<time_t>(optInt(row, 2));
+      entry.comment.account = optString(row, 3);
+      entry.comment.content = optString(row, 4);
+    }
+    catch (const std::exception& e) {
+      const auto message = "Invalid MySQL comment in zone '" + domain.name.toLogString() + "' name='" + sourceName + "' type='" + sourceType + "': " + e.what();
+      if (handleInvalidSourceData(message)) {
+        continue;
+      }
+    }
     comments.emplace_back(std::move(entry));
   }
   return comments;
@@ -1022,7 +1073,17 @@ void syncTSIGKeys(MySQL& mysql, LMDBBackend& lmdb)
   logInfo("syncing TSIG keys");
   std::vector<TSIGKey> keys;
   for (const auto& row : mysql.query("SELECT name,algorithm,secret FROM tsigkeys ORDER BY id")) {
-    keys.push_back({DNSName(optString(row, 0)), DNSName(optString(row, 1)), optString(row, 2)});
+    const auto sourceName = optString(row, 0);
+    const auto sourceAlgorithm = optString(row, 1);
+    try {
+      keys.push_back({DNSName(sourceName), DNSName(sourceAlgorithm), optString(row, 2)});
+    }
+    catch (const std::exception& e) {
+      const auto message = "Invalid MySQL TSIG key name='" + sourceName + "' algorithm='" + sourceAlgorithm + "': " + e.what();
+      if (handleInvalidSourceData(message)) {
+        continue;
+      }
+    }
   }
   lmdb.replaceTSIGKeys(keys);
   logInfo("synced TSIG keys imported=" + std::to_string(keys.size()));
@@ -1047,15 +1108,16 @@ void syncZone(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains, c
   }
   const auto domain = *maybeDomain;
   auto records = getRecords(mysql, domain);
-  recordDomains.replaceDomain(domain.id, records);
   auto comments = getComments(mysql, domain);
   auto metadata = getMetadata(mysql, domain);
   const auto nsec3 = getNSEC3Settings(metadata, domain.name);
   auto keys = getKeyData(mysql, domain);
 
   DomainInfo info;
+  bool createdDomain = false;
   if (!lmdb.getDomainInfo(domain.name, info, false)) {
     lmdb.createDomain(domain.name, domain.kind, parsePrimaries(domain.master), domain.account);
+    createdDomain = true;
     if (!lmdb.getDomainInfo(domain.name, info, false)) {
       throw std::runtime_error("Unable to find freshly created LMDB zone '" + domain.name.toLogString() + "'");
     }
@@ -1070,17 +1132,12 @@ void syncZone(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains, c
   replacement.catalog = domain.catalog;
   replacement.last_check = domain.lastCheck;
   replacement.notified_serial = domain.notifiedSerial;
-  if (!lmdb.replaceDomainInfo(replacement)) {
-    throw std::runtime_error("Unable to update LMDB domain metadata for zone '" + domain.name.toLogString() + "'");
-  }
-
-  lmdb.replaceDomainMetadata(domain.name, metadata);
-  lmdb.replaceDomainKeys(domain.name, keys, getArg("invalid-records") == "skip");
 
   if (!lmdb.startTransaction(domain.name, info.id)) {
     throw std::runtime_error("Unable to start LMDB transaction for zone '" + domain.name.toLogString() + "'");
   }
 
+  bool recordTransactionStarted = true;
   try {
     lmdb.deleteDomainCommentsInTransaction(info.id);
     std::map<DNSName, bool> nonterm;
@@ -1100,11 +1157,9 @@ void syncZone(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains, c
       }
       catch (const std::exception& e) {
         const auto message = "Invalid MySQL record id " + std::to_string(record.id) + " in zone '" + domain.name.toLogString() + "' name='" + record.sourceName + "' type='" + record.sourceType + "': " + e.what();
-        if (getArg("invalid-records") == "skip") {
-          logWarning("skipping " + message);
+        if (handleInvalidSourceData(message)) {
           continue;
         }
-        throw std::runtime_error(message + "; fix the source data or set --invalid-records=skip");
       }
     }
     if (!nonterm.empty()) {
@@ -1120,9 +1175,28 @@ void syncZone(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains, c
       lmdb.feedComment(comment.comment);
     }
     lmdb.commitTransaction();
+    recordTransactionStarted = false;
+
+    if (!lmdb.replaceDomainInfo(replacement)) {
+      throw std::runtime_error("Unable to update LMDB domain metadata for zone '" + domain.name.toLogString() + "'");
+    }
+    lmdb.replaceDomainMetadata(domain.name, metadata);
+    lmdb.replaceDomainKeys(domain.name, keys, skipInvalidRecords());
+    recordDomains.replaceDomain(domain.id, records);
   }
   catch (...) {
-    lmdb.abortTransaction();
+    if (recordTransactionStarted) {
+      lmdb.abortTransaction();
+    }
+    if (createdDomain) {
+      try {
+        recordDomains.forgetDomain(domain.id);
+        lmdb.deleteDomain(domain.name);
+      }
+      catch (const std::exception& e) {
+        logWarning("unable to clean up newly created LMDB zone after failed sync zone='" + domain.name.toLogString() + "': " + e.what());
+      }
+    }
     throw;
   }
 }
@@ -1889,12 +1963,12 @@ std::vector<std::string> extractInsertColumnValues(const std::string& sql, const
 std::set<domainid_t> extractDomainIdsFromStatement(const std::string& sql)
 {
   auto ids = extractDomainIdsFromInsertValues(sql);
-  static const std::regex domainIdPattern(R"((?:`?[[:alnum:]_]+`?\s*\.\s*)?`?domain_id`?\s*(?:=|in\s*\()\s*([0-9][0-9,\s]*)\)?)", std::regex::icase);
+  static const std::regex domainIdPattern(R"((^|[^[:alnum:]_])(?:`?[[:alnum:]_]+`?\s*\.\s*)?`?domain_id`?\s*(?:=|in\s*\()\s*([0-9][0-9,\s]*)\)?)", std::regex::icase);
   auto begin = std::sregex_iterator(sql.begin(), sql.end(), domainIdPattern);
   auto end = std::sregex_iterator();
   for (auto iter = begin; iter != end; ++iter) {
     std::vector<std::string> parts;
-    stringtok(parts, (*iter)[1].str(), ", ");
+    stringtok(parts, (*iter)[2].str(), ", ");
     for (const auto& part : parts) {
       if (!part.empty()) {
         ids.insert(static_cast<domainid_t>(std::stoll(part)));
@@ -1907,12 +1981,12 @@ std::set<domainid_t> extractDomainIdsFromStatement(const std::string& sql)
 std::set<uint64_t> extractRowIdsFromStatement(const std::string& sql)
 {
   std::set<uint64_t> ids;
-  static const std::regex rowIdPattern(R"((?:`?[[:alnum:]_]+`?\s*\.\s*)?`?id`?\s*(?:=|in\s*\()\s*([0-9][0-9,\s]*)\)?)", std::regex::icase);
+  static const std::regex rowIdPattern(R"((^|[^[:alnum:]_])(?:`?[[:alnum:]_]+`?\s*\.\s*)?`?id`?\s*(?:=|in\s*\()\s*([0-9][0-9,\s]*)\)?)", std::regex::icase);
   auto begin = std::sregex_iterator(sql.begin(), sql.end(), rowIdPattern);
   auto end = std::sregex_iterator();
   for (auto iter = begin; iter != end; ++iter) {
     std::vector<std::string> parts;
-    stringtok(parts, (*iter)[1].str(), ", ");
+    stringtok(parts, (*iter)[2].str(), ", ");
     for (const auto& part : parts) {
       if (!part.empty()) {
         ids.insert(std::stoull(part));
@@ -1922,33 +1996,92 @@ std::set<uint64_t> extractRowIdsFromStatement(const std::string& sql)
   return ids;
 }
 
-std::optional<ZoneName> extractDomainNameFromStatement(const std::string& sql)
+std::optional<ZoneName> parseZoneNameFromStatementValue(const std::string& value, bool& invalidName)
 {
-  static const std::regex namePattern(R"(\bname\b\s*=\s*'([^']+)')", std::regex::icase);
-  std::smatch match;
-  if (std::regex_search(sql, match, namePattern)) {
-    return ZoneName(match[1].str());
+  try {
+    return ZoneName(value);
   }
-  return std::nullopt;
+  catch (const std::exception& e) {
+    invalidName = true;
+    logWarning("binlog statement contains invalid zone name value='" + value + "': " + e.what());
+    return std::nullopt;
+  }
 }
 
-std::optional<std::pair<ZoneName, ZoneName>> extractDomainRenameFromStatement(const std::string& sql)
+std::set<ZoneName> extractDomainNamesFromStatement(const std::string& sql, bool& invalidName)
+{
+  std::set<ZoneName> names;
+  static const std::regex namePattern(R"(\bname\b\s*=\s*'([^']+)')", std::regex::icase);
+  auto begin = std::sregex_iterator(sql.begin(), sql.end(), namePattern);
+  auto end = std::sregex_iterator();
+  for (auto iter = begin; iter != end; ++iter) {
+    if (auto name = parseZoneNameFromStatementValue((*iter)[1].str(), invalidName)) {
+      names.insert(*name);
+    }
+  }
+  return names;
+}
+
+bool statementHasUnsafeNamePredicate(const std::string& sql)
+{
+  static const std::regex unsafeNamePredicate(R"(\bname\b\s*(?:not\s+)?(?:like|regexp|rlike)\b|\bname\b\s*(?:<>|!=|<|>|is\b))", std::regex::icase);
+  return std::regex_search(sql, unsafeNamePredicate);
+}
+
+bool startsWithSQLVerb(const std::string& sql, const std::string& verb)
+{
+  const auto lower = toLowerASCII(trim(sql));
+  return lower.rfind(verb, 0) == 0;
+}
+
+std::optional<std::string> extractWhereClause(const std::string& sql)
+{
+  static const std::regex wherePattern(R"(\bwhere\b([\s\S]*)$)", std::regex::icase);
+  std::smatch match;
+  if (!std::regex_search(sql, match, wherePattern)) {
+    return std::nullopt;
+  }
+  return match[1].str();
+}
+
+bool updateStatementAssignsName(const std::string& sql)
+{
+  static const std::regex updatePattern(R"(^\s*update\s+(?:`?[[:alnum:]_]+`?\.)?`?domains`?\s+set\s+([\s\S]*?)(?:\bwhere\b|$))", std::regex::icase);
+  static const std::regex namePattern(R"(\bname\b\s*=)", std::regex::icase);
+  std::smatch updateMatch;
+  if (!std::regex_search(sql, updateMatch, updatePattern)) {
+    return false;
+  }
+  return std::regex_search(updateMatch[1].str(), namePattern);
+}
+
+bool updateStatementAssignsDomainID(const std::string& sql)
+{
+  static const std::regex updatePattern(R"(^\s*update\s+(?:`?[[:alnum:]_]+`?\.)?`?[[:alnum:]_]+`?\s+set\s+([\s\S]*?)(?:\bwhere\b|$))", std::regex::icase);
+  static const std::regex domainIDPattern(R"(\bdomain_id\b\s*=)", std::regex::icase);
+  std::smatch updateMatch;
+  if (!std::regex_search(sql, updateMatch, updatePattern)) {
+    return false;
+  }
+  return std::regex_search(updateMatch[1].str(), domainIDPattern);
+}
+
+std::optional<std::pair<ZoneName, ZoneName>> extractDomainRenameFromStatement(const std::string& sql, bool& invalidName)
 {
   static const std::regex updatePattern(R"(^\s*update\s+(?:`?[[:alnum:]_]+`?\.)?`?domains`?\s+set\s+([\s\S]*?)\bwhere\b([\s\S]*)$)", std::regex::icase);
-  static const std::regex namePattern(R"(\bname\b\s*=\s*'([^']+)')", std::regex::icase);
   std::smatch updateMatch;
   if (!std::regex_search(sql, updateMatch, updatePattern)) {
     return std::nullopt;
   }
 
-  std::smatch setMatch;
-  std::smatch whereMatch;
   const auto setPart = updateMatch[1].str();
   const auto wherePart = updateMatch[2].str();
-  if (!std::regex_search(setPart, setMatch, namePattern) || !std::regex_search(wherePart, whereMatch, namePattern)) {
+  const auto setNames = extractDomainNamesFromStatement(setPart, invalidName);
+  const auto whereNames = extractDomainNamesFromStatement(wherePart, invalidName);
+  if (setNames.size() != 1 || whereNames.size() != 1) {
     return std::nullopt;
   }
-  return std::make_pair(ZoneName(whereMatch[1].str()), ZoneName(setMatch[1].str()));
+  return std::make_pair(*whereNames.begin(), *setNames.begin());
 }
 
 bool statementTouchesPowerDNSTable(const std::string& sql, const std::string& table)
@@ -1991,34 +2124,49 @@ StatementChange analyzeStatement(MySQL& mysql, const RecordDomainMap& recordDoma
   }
 
   if (table == "domains") {
-    const auto lower = toLowerASCII(sql);
-    if (lower.find("update") == 0) {
-      if (const auto rename = extractDomainRenameFromStatement(sql)) {
+    bool invalidStatementName = false;
+    if (startsWithSQLVerb(sql, "update")) {
+      if (const auto rename = extractDomainRenameFromStatement(sql, invalidStatementName)) {
         if (rename->first != rename->second) {
           change.deletedZones.insert(rename->first);
         }
         change.changedZones.insert(rename->second);
         return change;
       }
+      if (invalidStatementName || updateStatementAssignsName(sql) || statementHasUnsafeNamePredicate(sql)) {
+        change.needsFullResync = true;
+        return change;
+      }
     }
     for (const auto& name : extractInsertColumnValues(sql, "name")) {
       if (!name.empty() && toLowerASCII(name) != "null") {
-        change.changedZones.insert(ZoneName(name));
+        if (auto zone = parseZoneNameFromStatementValue(name, invalidStatementName)) {
+          change.changedZones.insert(*zone);
+        }
       }
+    }
+    if (invalidStatementName || statementHasUnsafeNamePredicate(sql)) {
+      change.needsFullResync = true;
+      return change;
     }
     if (!change.changedZones.empty()) {
       return change;
     }
-    if (const auto zone = extractDomainNameFromStatement(sql)) {
-      if (lower.find("delete") == 0 || lower.find("truncate") == 0) {
-        change.deletedZones.insert(*zone);
+    const auto zones = extractDomainNamesFromStatement(sql, invalidStatementName);
+    if (invalidStatementName) {
+      change.needsFullResync = true;
+      return change;
+    }
+    if (!zones.empty()) {
+      if (startsWithSQLVerb(sql, "delete") || startsWithSQLVerb(sql, "truncate")) {
+        change.deletedZones.insert(zones.begin(), zones.end());
       }
       else {
-        change.changedZones.insert(*zone);
+        change.changedZones.insert(zones.begin(), zones.end());
       }
       return change;
     }
-    if (lower.find("delete") != 0 && lower.find("truncate") != 0) {
+    if (!startsWithSQLVerb(sql, "delete") && !startsWithSQLVerb(sql, "truncate")) {
       for (const auto id : extractRowIdsFromStatement(sql)) {
         if (const auto zone = getZoneById(mysql, static_cast<domainid_t>(id))) {
           change.changedZones.insert(*zone);
@@ -2032,24 +2180,38 @@ StatementChange analyzeStatement(MySQL& mysql, const RecordDomainMap& recordDoma
     return change;
   }
 
-  for (const auto id : extractDomainIdsFromStatement(sql)) {
+  const auto lower = toLowerASCII(trim(sql));
+  const auto domainIDs = extractDomainIdsFromStatement(sql);
+  const auto rowIDs = extractRowIdsFromStatement(sql);
+  const auto whereClause = extractWhereClause(sql);
+  const auto whereDomainIDs = whereClause ? extractDomainIdsFromStatement(*whereClause) : std::set<domainid_t>{};
+  const bool unsafeNamePredicate = statementHasUnsafeNamePredicate(sql);
+
+  for (const auto id : domainIDs) {
     if (const auto zone = getZoneById(mysql, id)) {
       change.changedZones.insert(*zone);
     }
   }
 
-  if (!change.changedZones.empty()) {
+  if (unsafeNamePredicate) {
+    change.needsFullResync = true;
     return change;
   }
 
   if (table == "records" || table == "comments" || table == "domainmetadata" || table == "cryptokeys") {
-    const auto lower = toLowerASCII(sql);
     if (lower.find("truncate") != 0) {
-      const auto rowIds = extractRowIdsFromStatement(sql);
-      const auto zones = getZonesByRowIds(mysql, table, rowIds);
+      if ((lower.find("update") == 0 || lower.find("delete") == 0) && rowIDs.empty() && whereDomainIDs.empty()) {
+        change.needsFullResync = true;
+        return change;
+      }
+      const auto zones = getZonesByRowIds(mysql, table, rowIDs);
       change.changedZones.insert(zones.begin(), zones.end());
+      if (table != "records" && lower.find("update") == 0 && updateStatementAssignsDomainID(sql) && whereDomainIDs.empty()) {
+        change.needsFullResync = true;
+        return change;
+      }
       if (table == "records" && (lower.find("delete") == 0 || lower.find("update") == 0)) {
-        for (const auto rowID : rowIds) {
+        for (const auto rowID : rowIDs) {
           if (const auto domainID = recordDomains.lookup(rowID)) {
             if (const auto zone = getZoneById(mysql, *domainID)) {
               change.changedZones.insert(*zone);
@@ -2073,8 +2235,6 @@ bool lineIndicatesMissingBinlog(const std::string& line)
   return line.find("Could not find first log file name") != std::string::npos ||
          line.find("File not found") != std::string::npos ||
          line.find("not found in binary log index") != std::string::npos ||
-         line.find("Error reading packet from server") != std::string::npos ||
-         line.find("Got error reading packet from server") != std::string::npos ||
          line.find("start replication from position > file size") != std::string::npos;
 }
 
@@ -2157,7 +2317,8 @@ void followBinlog(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomain
         continue;
       }
 
-      if (line.rfind("#", 0) != 0 && line.rfind("###", 0) != 0) {
+      const bool rowCommitLine = line == "COMMIT/*!*/;" || line == "COMMIT";
+      if (!rowCommitLine && line.rfind("#", 0) != 0 && line.rfind("###", 0) != 0) {
         auto statementLine = line;
         const bool endsStatement = statementLine == "/*!*/;" || (statementLine.size() >= 6 && statementLine.compare(statementLine.size() - 6, 6, "/*!*/;") == 0);
         if (endsStatement) {
@@ -2165,11 +2326,13 @@ void followBinlog(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomain
           statementLine = marker == std::string::npos ? "" : statementLine.substr(0, marker);
         }
 
+        const bool skipStatementLine = statementSql.empty() &&
+                                       (statementLine == "BEGIN" ||
+                                        statementLine == "COMMIT" ||
+                                        statementLine.rfind("SET ", 0) == 0 ||
+                                        statementLine.rfind("SET @@", 0) == 0);
         if (!statementLine.empty() &&
-            statementLine != "BEGIN" &&
-            statementLine != "COMMIT" &&
-            statementLine.rfind("SET ", 0) != 0 &&
-            statementLine.rfind("SET @@", 0) != 0) {
+            !skipStatementLine) {
           if (!statementSql.empty()) {
             statementSql += '\n';
           }
@@ -2270,11 +2433,19 @@ void followBinlog(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomain
           else if (line.rfind("###   @2=", 0) == 0) {
             const auto name = parseRowStringValue(line);
             if (name && !name->empty() && *name != "NULL") {
-              if (deleteDomainRow || !domainValuesAreNew) {
-                oldDomainRowName = ZoneName(*name);
+              try {
+                if (deleteDomainRow || !domainValuesAreNew) {
+                  oldDomainRowName = ZoneName(*name);
+                }
+                else {
+                  newDomainRowName = ZoneName(*name);
+                }
               }
-              else {
-                newDomainRowName = ZoneName(*name);
+              catch (const std::exception& e) {
+                const auto message = "Invalid MySQL domain row from binlog name='" + *name + "': " + e.what();
+                if (handleInvalidSourceData(message)) {
+                  continue;
+                }
               }
             }
           }
@@ -2282,7 +2453,7 @@ void followBinlog(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomain
         continue;
       }
 
-      if (line.find("Xid = ") != std::string::npos || line == "COMMIT/*!*/;") {
+      if (line.find("Xid = ") != std::string::npos || rowCommitLine) {
         const bool hadDomainRowName = oldDomainRowName.has_value() || newDomainRowName.has_value();
         if (table == "domains") {
           if (deleteDomainRow) {
