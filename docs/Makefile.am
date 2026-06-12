@@ -12,10 +12,6 @@ if LDAP
 MANPAGES_INSTALL += zone2ldap.1
 endif
 
-if PDNS_MYSQL2LMDB
-MANPAGES_INSTALL += pdns-mysql2lmdb.1
-endif
-
 MANPAGES_DIST += pdns-mysql2lmdb.1
 
 MANPAGES_TARGET_TOOLS = calidns.1 \

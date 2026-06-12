@@ -24,10 +24,10 @@ events are used to identify affected PowerDNS zones directly and require
 ``binlog_row_image=FULL``.  Statement events are inspected for affected PowerDNS
 tables and zone identifiers.  If a binlog event touches PowerDNS data but the
 affected zone cannot be identified safely, the tool performs a full resync
-instead of applying a partial update.  In all incremental cases each affected
-zone is fetched from MySQL and atomically rewritten in LMDB.  This intentionally
-avoids maintaining a second record-level replication implementation for the LMDB
-backend.
+instead of applying a partial update.  Record, comment, metadata and key changes
+fetch each affected zone from MySQL and atomically rewrite it in LMDB.  Domain
+row updates that do not rename the zone update LMDB DomainInfo only, avoiding a
+full record rewrite for notification and health-check fields.
 
 If the saved binary log position is no longer available, the tool performs
 another full resync and resumes incremental replication from the new snapshot
@@ -39,13 +39,23 @@ configuration, whether a saved state file was found, full-resync reasons and
 snapshot positions, incremental binlog positions, binlog rotations, changed and
 deleted zone counts, TSIG refreshes, and state-file updates.
 
+For benchmarking and operational checks, the tool also has two one-shot modes
+that do not use ``mysqlbinlog`` and do not read or write the replication state
+file.  ``--sync-zone=ZONE`` synchronizes exactly one zone and exits.
+``--serial-scan`` reads all MySQL apex SOA serials, compares them with local
+LMDB SOA serials, synchronizes missing or changed zones, removes local zones
+that no longer exist in MySQL, refreshes TSIG keys, and exits.  These modes are
+intended to measure whether periodic SOA-serial polling is viable without
+changing the default binlog-following daemon.
+
 REQUIREMENTS
 ------------
 
 The MySQL primary must have binary logging enabled.  ``binlog_format=ROW`` is
-the most efficient mode because it identifies changed rows precisely.
-``MIXED`` and ``STATEMENT`` are supported, but complex statements can cause a
-full resync when the changed zone cannot be inferred safely.
+strongly recommended for production because it identifies changed rows
+precisely and avoids statement-text parsing edge cases.  ``MIXED`` and
+``STATEMENT`` are supported, but complex statements can cause a full resync when
+the changed zone cannot be inferred safely.
 ``binlog_row_image`` must be ``FULL`` so row events include enough data to map
 changes back to zones.  The MySQL user needs privileges to read the PowerDNS
 tables, execute ``SHOW MASTER STATUS`` or ``SHOW BINARY LOG STATUS`` and
@@ -84,20 +94,51 @@ OPTIONS
 
 --mysqlbinlog=PATH       Path to the ``mysqlbinlog`` client.
 
+--sync-zone=ZONE         Synchronize one zone from MySQL to LMDB and exit.  The
+                        zone is read from a consistent MySQL snapshot and then
+                        atomically rewritten in LMDB.  The completion log
+                        includes imported record, empty-non-terminal, comment,
+                        metadata and key counts, elapsed seconds, and
+                        records per second.  This mode does not require
+                        ``mysqlbinlog`` and does not use ``--state-file``.
+
 --lmdb-filename=PATH     Target LMDB backend file. Defaults to ``./pdns.lmdb``.
 
 --lmdb-sync-mode=MODE    LMDB synchronization mode. Defaults to ``nosync`` for
-                        this importer; the tool explicitly syncs LMDB before
-                        saving each applied binlog position.
+                        this importer; the tool explicitly syncs changed LMDB
+                        environments before saving applied binlog positions.
 
 --state-file=PATH        File storing the last applied binlog position. Relative
                         paths are resolved below the directory containing
                         ``--lmdb-filename``. Absolute paths are used unchanged.
 
+--state-save-transactions=NUM
+                        Number of applied binlog transactions to coalesce before
+                        syncing LMDB and saving the replication state. Defaults
+                        to ``100``.
+
+--state-save-interval=MSEC
+                        Maximum milliseconds to coalesce before syncing LMDB and
+                        saving a pending applied replication state, evaluated
+                        when another binlog transaction is applied.  An idle
+                        binlog stream may keep the pending state in memory until
+                        the next event, clean shutdown, reconnect or
+                        ``--once`` exit. Defaults to ``1000``.
+
 --full                  Force a full resync before following the binlog.
 
 --once                  Exit after the initial full resync or after one binlog
                         stream attempt.
+
+--serial-scan           Compare MySQL apex SOA serials with local LMDB SOA
+                        serials, synchronize missing or changed zones, delete
+                        stale local zones, refresh TSIG keys, and exit.  The
+                        MySQL serials are read directly from ``domains`` joined
+                        to enabled apex ``SOA`` rows in ``records``.  Domains
+                        without a readable enabled apex SOA follow the
+                        ``--invalid-records`` policy.  This mode does not
+                        require ``mysqlbinlog`` and does not use
+                        ``--state-file``.
 
 --retry-interval=SEC     Seconds to wait before reconnecting a stopped binlog
                         stream.
@@ -125,12 +166,40 @@ OPTIONS
 
 --help                  Show available options.
 
+EXAMPLES
+--------
+
+Synchronize one large zone into a scratch LMDB database and log throughput::
+
+  pdns-mysql2lmdb --mysql-defaults-file=/etc/pdns-mysql.cnf --mysql-dbname=powerdns --lmdb-filename=/tmp/pdns-bench.lmdb --sync-zone=example.org
+
+Run a one-shot SOA-serial scan against an existing benchmark LMDB database::
+
+  pdns-mysql2lmdb --mysql-defaults-file=/etc/pdns-mysql.cnf --mysql-dbname=powerdns --lmdb-filename=/tmp/pdns-bench.lmdb --serial-scan
+
 OPERATIONAL NOTES
 -----------------
 
 Empty non-terminals stored by the Generic MySQL backend as records with
 ``type=NULL`` are imported as LMDB ENT entries.  For NSEC3 zones, order names are
 interpreted based on the zone's ``NSEC3PARAM`` and ``NSEC3NARROW`` metadata.
+
+When ``--invalid-records=skip`` skips all DNSSEC keys for a signed zone, the
+zone is left unchanged in LMDB and is retried only when a later event touches the
+zone again or a full resync is forced.  Operators should monitor skip warnings
+and trigger a resync after repairing source data if immediate convergence is
+required.
+
+If the tool restarts after a MySQL ``ALTER TABLE`` but before the corresponding
+binlog event is replayed, row events generated before the DDL can be decoded
+with the newer column map.  The importer falls back to a full resync when it
+reaches the unsafe event, but a short transient window can remain.  Avoid schema
+changes while the importer is stopped.
+
+In ``STATEMENT`` or ``MIXED`` mode, statement values containing literal newline
+characters are rendered by ``mysqlbinlog`` as physical output lines.  Such lines
+can resemble mysqlbinlog headers or diagnostics.  Use ``binlog_format=ROW`` for
+production deployments to avoid this class of ambiguity.
 
 Externally created or deleted zones are noticed by a running ``pdns_server``
 after its regular zone-cache refresh interval unless the cache is flushed by

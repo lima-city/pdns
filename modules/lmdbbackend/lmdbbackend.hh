@@ -24,6 +24,8 @@
 #include "pdns/dnsbackend.hh"
 #include "ext/lmdb-safe/lmdb-typed.hh"
 
+#include <set>
+
 template <class T, typename std::enable_if<std::is_same<T, DNSName>::value, T>::type* = nullptr>
 std::string keyConv(const T& t)
 {
@@ -71,6 +73,7 @@ class LMDBBackend : public DNSBackend
 {
 public:
   static constexpr unsigned int CurrentSchemaVersion{6};
+  static void declareArguments(const string& prefix = "lmdb-", const string& syncModeDefault = "sync");
 
   explicit LMDBBackend(const string& suffix = "");
   ~LMDBBackend();
@@ -85,8 +88,10 @@ public:
   void replaceDomainMetadata(const ZoneName& name, const std::map<std::string, std::vector<std::string>>& meta);
   void replaceDomainKeys(const ZoneName& name, const std::vector<KeyData>& keys, bool skipInvalid = false);
   void replaceTSIGKeys(const std::vector<TSIGKey>& keys);
+  bool deleteDomainFromImporter(const ZoneName& domain);
   void deleteDomainCommentsInTransaction(domainid_t domain_id);
   void sync();
+  void syncDirty();
 
   bool startTransaction(const ZoneName& domain, domainid_t domain_id = UnknownDomainID) override;
   bool commitTransaction() override;
@@ -343,6 +348,8 @@ private:
   };
 
   vector<RecordsDB> d_trecords;
+  bool d_domainsDirty{false};
+  std::set<size_t> d_dirtyRecordShards;
 
   shared_ptr<tdomains_t> d_tdomains;
   shared_ptr<tmeta_t> d_tmeta;
@@ -368,6 +375,9 @@ private:
   bool findDomain(domainid_t domainid, DomainInfo& info) const;
   void consolidateDomainInfo(DomainInfo& info) const;
   void writeDomainInfo(const DomainInfo& info);
+  bool deleteDomainInternal(const ZoneName& domain);
+  void markDomainsDirty();
+  void markRecordShardDirty(domainid_t id);
   void writeTransientDomainInfo(const DomainInfo& info);
 
   void setLastCheckTime(domainid_t domain_id, time_t last_check);

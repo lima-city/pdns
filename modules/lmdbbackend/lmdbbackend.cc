@@ -1396,6 +1396,7 @@ void LMDBBackend::writeDomainInfo(const DomainInfo& info)
   auto txn = d_tdomains->getRWTransaction();
   txn.put(info, info.id);
   txn.commit();
+  markDomainsDirty();
   writeTransientDomainInfo(info);
 }
 
@@ -1935,6 +1936,7 @@ bool LMDBBackend::networkList(vector<pair<Netmask, string>>& networks)
 // NOLINTNEXTLINE(readability-identifier-length)
 std::shared_ptr<LMDBBackend::RecordsRWTransaction> LMDBBackend::getRecordsRWTransaction(domainid_t id)
 {
+  markRecordShardDirty(id);
   auto& shard = d_trecords[id % s_shards];
   if (!shard.env) {
     shard.env = getMDBEnv((getArg("filename") + "-" + std::to_string(id % s_shards)).c_str(),
@@ -1946,6 +1948,19 @@ std::shared_ptr<LMDBBackend::RecordsRWTransaction> LMDBBackend::getRecordsRWTran
   ret->db = std::make_shared<RecordsDB>(shard);
 
   return ret;
+}
+
+void LMDBBackend::markDomainsDirty()
+{
+  d_domainsDirty = true;
+}
+
+void LMDBBackend::markRecordShardDirty(domainid_t id)
+{
+  if (id < 0) {
+    return;
+  }
+  d_dirtyRecordShards.insert(static_cast<size_t>(id % s_shards));
 }
 
 // NOLINTNEXTLINE(readability-identifier-length)
@@ -1975,6 +1990,22 @@ std::shared_ptr<LMDBBackend::RecordsROTransaction> LMDBBackend::getRecordsROTran
 }
 
 bool LMDBBackend::deleteDomain(const ZoneName& domain)
+{
+  if (!d_rwtxn) {
+    throw PDNSException("deleteDomain called outside of transaction");
+  }
+  return deleteDomainInternal(domain);
+}
+
+bool LMDBBackend::deleteDomainFromImporter(const ZoneName& domain)
+{
+  if (d_rwtxn) {
+    throw PDNSException("deleteDomainFromImporter called inside active transaction");
+  }
+  return deleteDomainInternal(domain);
+}
+
+bool LMDBBackend::deleteDomainInternal(const ZoneName& domain)
 {
   bool hadTransaction = static_cast<bool>(d_rwtxn);
   domainid_t transactionDomainId = UnknownDomainID;
@@ -2043,6 +2074,7 @@ bool LMDBBackend::deleteDomain(const ZoneName& domain)
       auto container = s_transient_domain_info.write_lock();
       container->remove(static_cast<domainid_t>(id));
     }
+    markDomainsDirty();
     auto txn = d_tdomains->getRWTransaction();
     txn.del(id);
     txn.commit();
@@ -2498,6 +2530,7 @@ bool LMDBBackend::createDomain(const ZoneName& domain, const DomainInfo::DomainK
 
     txn.put(info, 0, d_random_ids, domain.hash());
     txn.commit();
+    markDomainsDirty();
     writeTransientDomainInfo(info);
   }
 
@@ -2523,6 +2556,7 @@ bool LMDBBackend::replaceDomainInfo(const DomainInfo& replacement)
     auto txn = d_tdomains->getRWTransaction();
     txn.put(info, info.id);
     txn.commit();
+    markDomainsDirty();
   }
   writeTransientDomainInfo(info);
   return true;
@@ -2545,6 +2579,7 @@ void LMDBBackend::replaceDomainMetadata(const ZoneName& name, const std::map<std
     }
   }
   txn.commit();
+  markDomainsDirty();
 }
 
 void LMDBBackend::replaceDomainKeys(const ZoneName& name, const std::vector<KeyData>& keys, bool skipInvalid)
@@ -2584,10 +2619,12 @@ void LMDBBackend::replaceDomainKeys(const ZoneName& name, const std::vector<KeyD
       g_log << Logger::Warning << "Skipping invalid DNSSEC key for zone '" << name.toLogString() << "' key id " << key.id << ": unknown error" << endl;
     }
   }
-  if (skipInvalid && !ids.empty() && !keys.empty() && importedKeys == 0) {
-    throw DBException("Refusing to replace all DNSSEC keys for previously signed zone '" + name.toLogString() + "' with zero valid keys");
+  if (skipInvalid && !keys.empty() && importedKeys == 0) {
+    g_log << Logger::Warning << "Skipping DNSSEC key replacement for zone '" << name.toLogString() << "' because none of the source keys are valid" << endl;
+    return;
   }
   txn.commit();
+  markDomainsDirty();
 }
 
 void LMDBBackend::replaceTSIGKeys(const std::vector<TSIGKey>& keys)
@@ -2598,6 +2635,7 @@ void LMDBBackend::replaceTSIGKeys(const std::vector<TSIGKey>& keys)
     txn.put(key, 0, d_random_ids, key.name.hash());
   }
   txn.commit();
+  markDomainsDirty();
 }
 
 void LMDBBackend::sync()
@@ -2608,6 +2646,46 @@ void LMDBBackend::sync()
       shard.env->sync(true);
     }
   }
+  d_domainsDirty = false;
+  d_dirtyRecordShards.clear();
+}
+
+void LMDBBackend::syncDirty()
+{
+  if (d_domainsDirty) {
+    d_tdomains->getEnv()->sync(true);
+    d_domainsDirty = false;
+  }
+  for (const auto shardIndex : d_dirtyRecordShards) {
+    if (shardIndex < d_trecords.size() && d_trecords.at(shardIndex).env) {
+      d_trecords.at(shardIndex).env->sync(true);
+    }
+  }
+  d_dirtyRecordShards.clear();
+}
+
+void LMDBBackend::declareArguments(const string& prefix, const string& syncModeDefault)
+{
+  const auto declareSetting = [](const string& name, const string& explanation, const string& value) {
+    ::arg().set(name, explanation) = value;
+    ::arg().setDefault(name, value);
+  };
+  const auto declareSwitch = [](const string& name, const string& explanation, const string& value) {
+    ::arg().setSwitch(name, explanation) = value;
+    ::arg().setDefault(name, value);
+  };
+
+  declareSetting(prefix + "filename", "Filename for lmdb", "./pdns.lmdb");
+  declareSetting(prefix + "sync-mode", "Synchronisation mode: nosync, nometasync, sync", syncModeDefault);
+  declareSetting(prefix + "shards", "Records database will be split into this number of shards", (sizeof(void*) == 4) ? "2" : "64");
+  declareSetting(prefix + "schema-version", "Maximum allowed schema version to run on this DB. If a lower version is found, auto update is performed", std::to_string(SCHEMAVERSION));
+  declareSwitch(prefix + "random-ids", "Numeric IDs inside the database are generated randomly instead of sequentially", "no");
+  declareSetting(prefix + "map-size", "main LMDB map size in megabytes", (sizeof(void*) == 4) ? "100" : "16000");
+  declareSetting(prefix + "shards-map-size", "shard LMDB map size in megabytes, zero to use the same size as main", "0");
+  declareSwitch(prefix + "flag-deleted", "Flag entries on deletion instead of deleting them", "no");
+  declareSwitch(prefix + "write-notification-update", "Update domain table upon notification", "yes");
+  declareSwitch(prefix + "split-domains-table", "Use a split domain table to reduce I/O load after XFR notifications", "no");
+  declareSwitch(prefix + "lightning-stream", "Run in Lightning Stream compatible mode", "no");
 }
 
 void LMDBBackend::getAllDomainsFiltered(vector<DomainInfo>* domains, const std::function<bool(DomainInfo&)>& allow)
@@ -3893,18 +3971,7 @@ public:
     BackendFactory("lmdb") {}
   void declareArguments(const string& suffix = "") override
   {
-    declare(suffix, "filename", "Filename for lmdb", "./pdns.lmdb");
-    declare(suffix, "sync-mode", "Synchronisation mode: nosync, nometasync, sync", "sync");
-    // there just is no room for more on 32 bit
-    declare(suffix, "shards", "Records database will be split into this number of shards", (sizeof(void*) == 4) ? "2" : "64");
-    declare(suffix, "schema-version", "Maximum allowed schema version to run on this DB. If a lower version is found, auto update is performed", std::to_string(SCHEMAVERSION));
-    declare(suffix, "random-ids", "Numeric IDs inside the database are generated randomly instead of sequentially", "no");
-    declare(suffix, "map-size", "main LMDB map size in megabytes", (sizeof(void*) == 4) ? "100" : "16000");
-    declare(suffix, "shards-map-size", "shard LMDB map size in megabytes, zero to use the same size as main", "0");
-    declare(suffix, "flag-deleted", "Flag entries on deletion instead of deleting them", "no");
-    declare(suffix, "write-notification-update", "Update domain table upon notification", "yes");
-    declare(suffix, "split-domains-table", "Use a split domain table to reduce I/O load after XFR notifications", "no");
-    declare(suffix, "lightning-stream", "Run in Lightning Stream compatible mode", "no");
+    LMDBBackend::declareArguments("lmdb" + suffix + "-", "sync");
   }
   DNSBackend* make(const string& suffix = "") override
   {
