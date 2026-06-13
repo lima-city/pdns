@@ -827,7 +827,11 @@ public:
         first = false;
         T value;
         deserializeFromBuffer(data.get<std::string>(), value);
+#ifndef DNSDIST
+        clearIndex(key.getNoStripHeader<uint32_t>(), value);
+#else
         clearIndex(key.get<uint32_t>(), value);
+#endif
         cursor.del(key);
       }
     }

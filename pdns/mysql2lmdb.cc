@@ -1719,7 +1719,7 @@ int runSyncZoneMode(MySQL& mysql, LMDBBackend& lmdb)
   return 0;
 }
 
-SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb)
+SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress = true)
 {
   SerialScanStats stats;
   RecordDomainMap recordDomains;
@@ -1767,7 +1767,7 @@ SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb)
       }
     }
 
-    if (stats.comparedZones % 1000 == 0) {
+    if (logProgress && stats.comparedZones % 1000 == 0) {
       logInfo("serial scan progress compared_zones=" + std::to_string(stats.comparedZones) + "/" + std::to_string(snapshot.zones.size()) + " current_zones=" + std::to_string(stats.currentZones) + " synced_zones=" + std::to_string(stats.syncedZones) + " deleted_local_zones=" + std::to_string(stats.deletedLocalZones));
     }
   }
@@ -1777,12 +1777,9 @@ SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb)
   return stats;
 }
 
-int runSerialScanMode(MySQL& mysql, LMDBBackend& lmdb)
+void logSerialScanStats(const std::string& label, const SerialScanStats& stats, double elapsed, const std::string& suffix = "")
 {
-  const auto started = std::chrono::steady_clock::now();
-  const auto stats = runSerialScan(mysql, lmdb);
-  const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-  logInfo("serial scan completed mysql_zones=" + std::to_string(stats.mysqlZones) +
+  logInfo(label + " mysql_zones=" + std::to_string(stats.mysqlZones) +
           " compared_zones=" + std::to_string(stats.comparedZones) +
           " current_zones=" + std::to_string(stats.currentZones) +
           " synced_zones=" + std::to_string(stats.syncedZones) +
@@ -1791,8 +1788,58 @@ int runSerialScanMode(MySQL& mysql, LMDBBackend& lmdb)
           " skipped_invalid_soa=" + std::to_string(stats.skippedInvalidSOA) +
           " " + describeZoneSyncStats(stats.imported) +
           " elapsed_sec=" + formatSeconds(elapsed) +
-          " records_per_sec=" + formatRate(stats.imported.records, elapsed));
+          " records_per_sec=" + formatRate(stats.imported.records, elapsed) +
+          suffix);
+}
+
+int runSerialScanMode(MySQL& mysql, LMDBBackend& lmdb)
+{
+  const auto started = std::chrono::steady_clock::now();
+  const auto stats = runSerialScan(mysql, lmdb);
+  const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  logSerialScanStats("serial scan completed", stats, elapsed);
   trimAllocator("serial scan completed");
+  return 0;
+}
+
+void sleepUntilNextPoll(unsigned int intervalSeconds)
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(intervalSeconds);
+  while (!terminationRequested()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return;
+    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    std::this_thread::sleep_for(std::min(remaining, std::chrono::milliseconds(200)));
+  }
+}
+
+int runSerialPollMode(MySQL& mysql, LMDBBackend& lmdb)
+{
+  const auto intervalSeconds = static_cast<unsigned int>(::arg().asNum("poll-interval", 5));
+  if (intervalSeconds == 0) {
+    throw std::runtime_error("--poll-interval must be greater than zero");
+  }
+
+  size_t round = 0;
+  while (!terminationRequested()) {
+    ++round;
+    const auto started = std::chrono::steady_clock::now();
+    const auto stats = runSerialScan(mysql, lmdb, false);
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    logSerialScanStats("serial poll round completed round=" + std::to_string(round), stats, elapsed, " next_poll_sec=" + std::to_string(intervalSeconds));
+    trimAllocator("serial poll round completed");
+
+    if (getBoolArg("once")) {
+      logInfo("once mode completed after serial poll round");
+      return 0;
+    }
+
+    sleepUntilNextPoll(intervalSeconds);
+  }
+
+  logInfo("termination requested; serial poll mode stopped");
   return 0;
 }
 
@@ -3718,12 +3765,14 @@ void declareArguments()
   ::arg().set("state-save-transactions", "Applied binlog transactions to coalesce before saving replication state") = "100";
   ::arg().set("state-save-interval", "Milliseconds to coalesce applied binlog transactions before saving replication state, checked when another transaction is applied") = "1000";
   ::arg().set("retry-interval", "Seconds to wait before retrying a stopped binlog stream") = "5";
+  ::arg().set("poll-interval", "Seconds to wait between SOA serial polling rounds") = "5";
   ::arg().set("soa-serial-overflow", "How to handle SOA serials larger than 32 bits: reject, modulo, clamp") = "reject";
   ::arg().set("invalid-records", "How to handle invalid MySQL records: reject, skip") = "reject";
 
   ::arg().setSwitch("allow-missing-mysqlbinlog", "Allow startup without mysqlbinlog; incremental replication will not work") = "no";
+  ::arg().setSwitch("binlog-follow", "Use the legacy mysqlbinlog-following replication mode instead of SOA serial polling") = "no";
   ::arg().setSwitch("full", "Run a full resync before following the binlog") = "no";
-  ::arg().setSwitch("once", "Exit after the initial full resync or one binlog stream attempt") = "no";
+  ::arg().setSwitch("once", "Exit after one SOA serial polling round or one legacy binlog stream attempt") = "no";
   ::arg().setSwitch("serial-scan", "Compare MySQL apex SOA serials with local LMDB serials, synchronize changed zones, and exit") = "no";
   ::arg().setCmd("help", "Provide a helpful message");
   ::arg().setCmd("version", "Print the version");
@@ -3756,15 +3805,22 @@ try
 
   const bool syncZoneMode = !getArg("sync-zone").empty();
   const bool serialScanMode = ::arg().mustDo("serial-scan");
-  const bool benchmarkMode = syncZoneMode || serialScanMode;
+  const bool binlogFollowMode = ::arg().mustDo("binlog-follow");
+  const bool oneShotMode = syncZoneMode || serialScanMode;
   if (syncZoneMode && serialScanMode) {
     throw std::runtime_error("--sync-zone and --serial-scan are mutually exclusive");
   }
-  if (benchmarkMode && ::arg().mustDo("full")) {
+  if (binlogFollowMode && oneShotMode) {
+    throw std::runtime_error("--binlog-follow cannot be combined with --sync-zone or --serial-scan");
+  }
+  if (oneShotMode && ::arg().mustDo("full")) {
     throw std::runtime_error("--full cannot be combined with --sync-zone or --serial-scan");
   }
+  if (!binlogFollowMode && ::arg().mustDo("full")) {
+    throw std::runtime_error("--full requires --binlog-follow; the default SOA serial polling mode only synchronizes missing or changed zones");
+  }
 
-  if (benchmarkMode) {
+  if (oneShotMode) {
     MySQL mysql;
     LMDBBackend lmdb;
     logInfo("startup mysql_db='" + getArg("mysql-dbname") + "' lmdb='" + getArg("lmdb-filename") + "' defaults_file=" + std::string(getArg("mysql-defaults-file").empty() ? "no" : "yes") + " mode=" + (syncZoneMode ? "sync-zone" : "serial-scan"));
@@ -3772,6 +3828,13 @@ try
       return runSyncZoneMode(mysql, lmdb);
     }
     return runSerialScanMode(mysql, lmdb);
+  }
+
+  if (!binlogFollowMode) {
+    MySQL mysql;
+    LMDBBackend lmdb;
+    logInfo("startup mysql_db='" + getArg("mysql-dbname") + "' lmdb='" + getArg("lmdb-filename") + "' defaults_file=" + std::string(getArg("mysql-defaults-file").empty() ? "no" : "yes") + " mode=serial-poll poll_interval_sec=" + std::to_string(::arg().asNum("poll-interval", 5)) + " once=" + std::string(getBoolArg("once") ? "yes" : "no"));
+    return runSerialPollMode(mysql, lmdb);
   }
 
   if (!getArg("mysql-password").empty() && getArg("mysql-defaults-file").empty() && !::arg().mustDo("allow-missing-mysqlbinlog")) {
@@ -3794,7 +3857,7 @@ try
   LMDBBackend lmdb;
   RecordDomainMap recordDomains;
 
-  logInfo("startup mysql_db='" + getArg("mysql-dbname") + "' lmdb='" + getArg("lmdb-filename") + "' state_file='" + resolvedStateFile() + "' defaults_file=" + std::string(getArg("mysql-defaults-file").empty() ? "no" : "yes") + " once=" + std::string(getBoolArg("once") ? "yes" : "no") + " force_full=" + std::string(::arg().mustDo("full") ? "yes" : "no"));
+  logInfo("startup mysql_db='" + getArg("mysql-dbname") + "' lmdb='" + getArg("lmdb-filename") + "' state_file='" + resolvedStateFile() + "' defaults_file=" + std::string(getArg("mysql-defaults-file").empty() ? "no" : "yes") + " mode=binlog-follow once=" + std::string(getBoolArg("once") ? "yes" : "no") + " force_full=" + std::string(::arg().mustDo("full") ? "yes" : "no"));
   auto state = loadState();
   if (::arg().mustDo("full") || !state) {
     const auto reason = ::arg().mustDo("full") ? std::string("--full requested") : std::string("no saved replication state");
