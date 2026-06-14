@@ -1,0 +1,1 @@
+PDNS_MYSQL2LMDB_ARGS="--lmdb-filename=/var/lib/powerdns/pdns.lmdb --lmdb-lightning-stream --lmdb-shards=1 --mysql-defaults-file=/etc/powerdns/lmdb-replication.cnf --mysql-dbname=dns --soa-serial-overflow=modulo --invalid-records=skip --poll-interval=10"

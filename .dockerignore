@@ -1,8 +1,13 @@
 builder/tmp
 built_pkgs
+deb-package/out
 **/venv
 **/*.1
 !.git/**
 *.o
 *.la
 *.a
+*.deb
+*.lmdb
+*.lmdb-*
+*.state
