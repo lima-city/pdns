@@ -2507,6 +2507,11 @@ void applyChangedZones(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordD
   for (const auto& zone : deletedZones) {
     deleteZoneIfPresent(lmdb, recordDomains, zone);
   }
+
+  std::unique_ptr<ConsistentReadTransaction> transaction;
+  if (!zones.empty() || !domainInfoZones.empty() || syncTSIG) {
+    transaction = std::make_unique<ConsistentReadTransaction>(mysql, "apply incremental changes");
+  }
   for (const auto& zone : domainInfoZones) {
     if (zones.count(zone) == 0 && deletedZones.count(zone) == 0) {
       syncDomainInfo(mysql, lmdb, recordDomains, zone);
@@ -2517,6 +2522,9 @@ void applyChangedZones(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordD
   }
   if (syncTSIG) {
     syncTSIGKeys(mysql, lmdb);
+  }
+  if (transaction) {
+    transaction->commit();
   }
   logInfo("applied incremental changes");
 }
