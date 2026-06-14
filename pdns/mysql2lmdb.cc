@@ -1517,16 +1517,18 @@ void syncTSIGKeys(MySQL& mysql, LMDBBackend& lmdb)
   logInfo("synced TSIG keys imported=" + std::to_string(keys.size()));
 }
 
-void deleteZoneIfPresent(LMDBBackend& lmdb, RecordDomainMap& recordDomains, const ZoneName& zone)
+void deleteZoneIfPresent(LMDBBackend& lmdb, RecordDomainMap* recordDomains, const ZoneName& zone)
 {
   DomainInfo existing;
   if (lmdb.getDomainInfo(zone, existing, false)) {
-    recordDomains.forgetZone(zone);
+    if (recordDomains != nullptr) {
+      recordDomains->forgetZone(zone);
+    }
     lmdb.deleteDomainFromImporter(zone);
   }
 }
 
-bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains, const MySQLDomain& domain, ZoneSyncStats* stats = nullptr)
+bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap* recordDomains, const MySQLDomain& domain, ZoneSyncStats* stats = nullptr)
 {
   auto comments = getComments(mysql, domain);
   auto metadata = getMetadata(mysql, domain);
@@ -1582,7 +1584,9 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains,
     lmdb.deleteDomainCommentsInTransaction(info.id);
     std::map<DNSName, bool> nonterm;
     forEachRecord(mysql, domain, [&](MySQLRecord record) {
-      recordIDs.push_back(record.id);
+      if (recordDomains != nullptr) {
+        recordIDs.push_back(record.id);
+      }
       record.rr.domain_id = info.id;
       if (record.isENT) {
         ++currentStats.emptyNonTerminals;
@@ -1625,7 +1629,9 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains,
     }
     lmdb.replaceDomainMetadata(domain.name, metadata);
     lmdb.replaceDomainKeys(domain.name, keys, false);
-    recordDomains.replaceDomain(domain.id, domain.name, recordIDs);
+    if (recordDomains != nullptr) {
+      recordDomains->replaceDomain(domain.id, domain.name, recordIDs);
+    }
     if (stats != nullptr) {
       stats->add(currentStats);
     }
@@ -1636,7 +1642,9 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains,
     }
     if (createdDomain) {
       try {
-        recordDomains.forgetDomain(domain.id);
+        if (recordDomains != nullptr) {
+          recordDomains->forgetDomain(domain.id);
+        }
         lmdb.deleteDomainFromImporter(domain.name);
       }
       catch (const std::exception& e) {
@@ -1648,7 +1656,7 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains,
   return true;
 }
 
-bool syncZone(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains, const ZoneName& zone, ZoneSyncStats* stats = nullptr, ZoneSyncOutcome* outcome = nullptr)
+bool syncZone(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap* recordDomains, const ZoneName& zone, ZoneSyncStats* stats = nullptr, ZoneSyncOutcome* outcome = nullptr)
 {
   const auto lookup = findDomainByName(mysql, zone);
   if (lookup.status == DomainLookupStatus::Missing) {
@@ -1696,7 +1704,7 @@ std::string describeZoneSyncStats(const ZoneSyncStats& stats)
          " keys=" + std::to_string(stats.keys);
 }
 
-bool syncZoneInConsistentRead(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains, const ZoneName& zone, ZoneSyncStats* stats = nullptr, ZoneSyncOutcome* outcome = nullptr)
+bool syncZoneInConsistentRead(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap* recordDomains, const ZoneName& zone, ZoneSyncStats* stats = nullptr, ZoneSyncOutcome* outcome = nullptr)
 {
   ConsistentReadTransaction transaction(mysql, "sync zone " + zone.toLogString());
   const auto synced = syncZone(mysql, lmdb, recordDomains, zone, stats, outcome);
@@ -1707,11 +1715,10 @@ bool syncZoneInConsistentRead(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& 
 int runSyncZoneMode(MySQL& mysql, LMDBBackend& lmdb)
 {
   const ZoneName zone(getArg("sync-zone"));
-  RecordDomainMap recordDomains;
   ZoneSyncStats stats;
   ZoneSyncOutcome outcome{ZoneSyncOutcome::Skipped};
   const auto started = std::chrono::steady_clock::now();
-  syncZoneInConsistentRead(mysql, lmdb, recordDomains, zone, &stats, &outcome);
+  syncZoneInConsistentRead(mysql, lmdb, nullptr, zone, &stats, &outcome);
   lmdb.syncDirty();
   const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
   logInfo("single zone sync completed zone='" + zone.toLogString() + "' result=" + outcomeToString(outcome) + " " + describeZoneSyncStats(stats) + " elapsed_sec=" + formatSeconds(elapsed) + " records_per_sec=" + formatRate(stats.records, elapsed));
@@ -1722,7 +1729,6 @@ int runSyncZoneMode(MySQL& mysql, LMDBBackend& lmdb)
 SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress = true)
 {
   SerialScanStats stats;
-  RecordDomainMap recordDomains;
   MySQLZoneSerialSnapshot snapshot;
 
   {
@@ -1757,7 +1763,7 @@ SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress 
     else {
       ZoneSyncStats zoneStats;
       ZoneSyncOutcome outcome{ZoneSyncOutcome::Skipped};
-      syncZoneInConsistentRead(mysql, lmdb, recordDomains, zone.domain.name, &zoneStats, &outcome);
+      syncZoneInConsistentRead(mysql, lmdb, nullptr, zone.domain.name, &zoneStats, &outcome);
       if (outcome == ZoneSyncOutcome::Synced) {
         ++stats.syncedZones;
         stats.imported.add(zoneStats);
@@ -1908,7 +1914,7 @@ BinlogPosition fullResyncOnce(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& 
     size_t skippedZones = 0;
     for (const auto& domain : snapshot.domains) {
       throwIfTerminationRequested();
-      if (!syncDomain(mysql, lmdb, recordDomains, domain)) {
+      if (!syncDomain(mysql, lmdb, &recordDomains, domain)) {
         ++skippedZones;
       }
       ++syncedZones;
@@ -2471,7 +2477,7 @@ void syncDomainInfo(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDoma
 {
   const auto lookup = findDomainByName(mysql, zone);
   if (lookup.status == DomainLookupStatus::Missing) {
-    deleteZoneIfPresent(lmdb, recordDomains, zone);
+    deleteZoneIfPresent(lmdb, &recordDomains, zone);
     return;
   }
   if (lookup.status == DomainLookupStatus::Invalid || !lookup.domain) {
@@ -2482,7 +2488,7 @@ void syncDomainInfo(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDoma
   const auto& domain = *lookup.domain;
   DomainInfo info;
   if (!lmdb.getDomainInfo(domain.name, info, false)) {
-    syncZone(mysql, lmdb, recordDomains, domain.name);
+    syncZone(mysql, lmdb, &recordDomains, domain.name);
     return;
   }
 
@@ -2505,7 +2511,7 @@ void applyChangedZones(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordD
 {
   logInfo("applying incremental changes changed_zones=" + summarizeZones(zones) + " deleted_zones=" + summarizeZones(deletedZones) + " domain_info_zones=" + summarizeZones(domainInfoZones) + " sync_tsig=" + std::string(syncTSIG ? "yes" : "no"));
   for (const auto& zone : deletedZones) {
-    deleteZoneIfPresent(lmdb, recordDomains, zone);
+    deleteZoneIfPresent(lmdb, &recordDomains, zone);
   }
 
   std::unique_ptr<ConsistentReadTransaction> transaction;
@@ -2518,7 +2524,7 @@ void applyChangedZones(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordD
     }
   }
   for (const auto& zone : zones) {
-    syncZone(mysql, lmdb, recordDomains, zone);
+    syncZone(mysql, lmdb, &recordDomains, zone);
   }
   if (syncTSIG) {
     syncTSIGKeys(mysql, lmdb);
