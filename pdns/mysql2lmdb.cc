@@ -985,12 +985,12 @@ public:
     d_zoneByDomain[domainID] = zone;
   }
 
-  void replaceDomain(domainid_t domainID, const ZoneName& zone, const std::vector<MySQLRecord>& records)
+  void replaceDomain(domainid_t domainID, const ZoneName& zone, const std::vector<uint64_t>& recordIDs)
   {
     forgetDomain(domainID);
     rememberDomain(domainID, zone);
-    for (const auto& record : records) {
-      remember(record.id, domainID);
+    for (const auto recordID : recordIDs) {
+      remember(recordID, domainID);
     }
   }
 
@@ -1287,51 +1287,56 @@ MySQLZoneSerialSnapshot getMySQLZoneSerialSnapshot(MySQL& mysql)
   return snapshot;
 }
 
-std::vector<MySQLRecord> getRecords(MySQL& mysql, const MySQLDomain& domain)
+std::optional<MySQLRecord> parseRecordRow(const std::vector<std::optional<std::string>>& row, const MySQLDomain& domain)
 {
-  std::vector<MySQLRecord> records;
-  const auto rows = mysql.query("SELECT id,name,type,content,ttl,prio,disabled,ordername,auth FROM records WHERE domain_id=" + std::to_string(domain.id) + " ORDER BY id");
-  for (const auto& row : rows) {
-    MySQLRecord record;
-    record.id = static_cast<uint64_t>(optInt(row, 0));
-    record.sourceName = optString(row, 1);
-    record.sourceType = optString(row, 2);
-    record.sourceContent = optString(row, 3);
-    record.sourceOrdername = optString(row, 7);
-    record.hasOrdername = !record.sourceOrdername.empty();
-    try {
-      record.rr.domain_id = domain.id;
-      record.rr.qname = DNSName(record.sourceName);
-      if (!record.rr.qname.isPartOf(domain.name)) {
-        throw std::runtime_error("record name is outside the zone");
-      }
-      record.rr.auth = optInt(row, 8, 1) != 0;
-      if (record.sourceType.empty()) {
-        record.isENT = true;
-        records.emplace_back(std::move(record));
-        continue;
-      }
-      record.rr.qtype = QType(QType::chartocode(record.sourceType.c_str()));
-      record.rr.content = record.sourceContent;
-      if (record.rr.qtype == QType::SOA) {
-        record.rr.content = normalizeSOAContent(domain.name, record.rr.qname, record.rr.content);
-      }
-      record.rr.ttl = static_cast<uint32_t>(optInt(row, 4));
-      record.rr.qclass = QClass::IN;
-      record.rr.disabled = optInt(row, 6) != 0;
-      if (record.rr.qtype == QType::MX || record.rr.qtype == QType::SRV) {
-        record.rr.content = std::to_string(optInt(row, 5)) + " " + record.rr.content;
-      }
+  MySQLRecord record;
+  record.id = static_cast<uint64_t>(optInt(row, 0));
+  record.sourceName = optString(row, 1);
+  record.sourceType = optString(row, 2);
+  record.sourceContent = optString(row, 3);
+  record.sourceOrdername = optString(row, 7);
+  record.hasOrdername = !record.sourceOrdername.empty();
+  try {
+    record.rr.domain_id = domain.id;
+    record.rr.qname = DNSName(record.sourceName);
+    if (!record.rr.qname.isPartOf(domain.name)) {
+      throw std::runtime_error("record name is outside the zone");
     }
-    catch (const std::exception& e) {
-      const auto message = "Invalid MySQL record id " + std::to_string(record.id) + " in zone '" + domain.name.toLogString() + "' name='" + record.sourceName + "' type='" + record.sourceType + "': " + e.what();
-      if (handleInvalidSourceData(message)) {
-        continue;
-      }
+    record.rr.auth = optInt(row, 8, 1) != 0;
+    if (record.sourceType.empty()) {
+      record.isENT = true;
+      return record;
     }
-    records.emplace_back(std::move(record));
+    record.rr.qtype = QType(QType::chartocode(record.sourceType.c_str()));
+    record.rr.content = record.sourceContent;
+    if (record.rr.qtype == QType::SOA) {
+      record.rr.content = normalizeSOAContent(domain.name, record.rr.qname, record.rr.content);
+    }
+    record.rr.ttl = static_cast<uint32_t>(optInt(row, 4));
+    record.rr.qclass = QClass::IN;
+    record.rr.disabled = optInt(row, 6) != 0;
+    if (record.rr.qtype == QType::MX || record.rr.qtype == QType::SRV) {
+      record.rr.content = std::to_string(optInt(row, 5)) + " " + record.rr.content;
+    }
   }
-  return records;
+  catch (const std::exception& e) {
+    const auto message = "Invalid MySQL record id " + std::to_string(record.id) + " in zone '" + domain.name.toLogString() + "' name='" + record.sourceName + "' type='" + record.sourceType + "': " + e.what();
+    if (handleInvalidSourceData(message)) {
+      return std::nullopt;
+    }
+  }
+  return record;
+}
+
+template <typename Callback>
+void forEachRecord(MySQL& mysql, const MySQLDomain& domain, Callback callback)
+{
+  mysql.forEachRow("SELECT id,name,type,content,ttl,prio,disabled,ordername,auth FROM records WHERE domain_id=" + std::to_string(domain.id) + " ORDER BY id", [&domain, &callback](const auto& row) {
+    auto record = parseRecordRow(row, domain);
+    if (record) {
+      callback(std::move(*record));
+    }
+  });
 }
 
 std::map<std::string, std::vector<std::string>> getMetadata(MySQL& mysql, const MySQLDomain& domain)
@@ -1523,7 +1528,6 @@ void deleteZoneIfPresent(LMDBBackend& lmdb, RecordDomainMap& recordDomains, cons
 
 bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains, const MySQLDomain& domain, ZoneSyncStats* stats = nullptr)
 {
-  auto records = getRecords(mysql, domain);
   auto comments = getComments(mysql, domain);
   auto metadata = getMetadata(mysql, domain);
   const auto nsec3 = getNSEC3Settings(metadata, domain.name);
@@ -1541,14 +1545,6 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains,
   }
 
   ZoneSyncStats currentStats;
-  for (const auto& record : records) {
-    if (record.isENT) {
-      ++currentStats.emptyNonTerminals;
-    }
-    else {
-      ++currentStats.records;
-    }
-  }
   currentStats.comments = comments.size();
   currentStats.metadataKinds = metadata.size();
   for (const auto& entry : metadata) {
@@ -1581,15 +1577,19 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains,
   }
 
   bool recordTransactionStarted = true;
+  std::vector<uint64_t> recordIDs;
   try {
     lmdb.deleteDomainCommentsInTransaction(info.id);
     std::map<DNSName, bool> nonterm;
-    for (auto record : records) {
+    forEachRecord(mysql, domain, [&](MySQLRecord record) {
+      recordIDs.push_back(record.id);
       record.rr.domain_id = info.id;
       if (record.isENT) {
+        ++currentStats.emptyNonTerminals;
         nonterm[record.rr.qname] = record.rr.auth;
-        continue;
+        return;
       }
+      ++currentStats.records;
       try {
         DNSName ordername;
         const bool ordernameIsNSEC3 = nsec3.present && !nsec3.narrow && record.hasOrdername;
@@ -1601,10 +1601,10 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains,
       catch (const std::exception& e) {
         const auto message = "Invalid MySQL record id " + std::to_string(record.id) + " in zone '" + domain.name.toLogString() + "' name='" + record.sourceName + "' type='" + record.sourceType + "': " + e.what();
         if (handleInvalidSourceData(message)) {
-          continue;
+          return;
         }
       }
-    }
+    });
     if (!nonterm.empty()) {
       if (nsec3.present) {
         lmdb.feedEnts3(info.id, domain.name.operator const DNSName&(), nonterm, nsec3.param, nsec3.narrow);
@@ -1625,7 +1625,7 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap& recordDomains,
     }
     lmdb.replaceDomainMetadata(domain.name, metadata);
     lmdb.replaceDomainKeys(domain.name, keys, false);
-    recordDomains.replaceDomain(domain.id, domain.name, records);
+    recordDomains.replaceDomain(domain.id, domain.name, recordIDs);
     if (stats != nullptr) {
       stats->add(currentStats);
     }
