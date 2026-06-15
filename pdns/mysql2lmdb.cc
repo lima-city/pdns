@@ -208,7 +208,7 @@ struct MySQLZoneSerialSnapshot
 {
   std::vector<MySQLZoneSerial> zones;
   std::set<ZoneName> presentZones;
-  uint64_t readTimestamp{0};
+  uint64_t replicationCursor{0};
   size_t skippedMissingSOA{0};
   size_t skippedInvalidSOA{0};
 };
@@ -1288,22 +1288,24 @@ std::optional<uint32_t> parseSOASerialForScan(const ZoneName& zone, const std::s
   }
 }
 
-uint64_t getMySQLUnixTimestamp(MySQL& mysql)
+uint64_t parseReplicationCursorFromRow(const std::vector<std::optional<std::string>>& row, size_t index, const std::string& context)
 {
-  const auto rows = mysql.query("SELECT UNIX_TIMESTAMP()");
-  if (rows.empty() || rows.at(0).empty() || !rows.at(0).at(0)) {
-    throw std::runtime_error("MySQL did not return UNIX_TIMESTAMP()");
+  const auto value = optString(row, index);
+  if (value.empty()) {
+    throw std::runtime_error("missing domains." + std::string(ReplicationCursorColumn) + " during " + context);
   }
 
-  const auto timestamp = parseUInt64Strict(*rows.at(0).at(0));
-  if (!timestamp) {
-    throw std::runtime_error("MySQL returned invalid UNIX_TIMESTAMP() value '" + *rows.at(0).at(0) + "'");
+  const auto parsed = parseUInt64Strict(value);
+  if (!parsed) {
+    throw std::runtime_error("invalid domains." + std::string(ReplicationCursorColumn) + " value '" + value + "' during " + context);
   }
-  return *timestamp;
+  return *parsed;
 }
 
 void appendZoneSerialFromRow(MySQLZoneSerialSnapshot& snapshot, const std::vector<std::optional<std::string>>& row, const std::string& context)
 {
+  snapshot.replicationCursor = std::max(snapshot.replicationCursor, parseReplicationCursorFromRow(row, 10, context));
+
   if (auto zone = parseZoneNameFromSource(optString(row, 1), "during " + context + " presence id=" + optString(row, 0))) {
     snapshot.presentZones.insert(*zone);
   }
@@ -1335,8 +1337,7 @@ void appendZoneSerialFromRow(MySQLZoneSerialSnapshot& snapshot, const std::vecto
 MySQLZoneSerialSnapshot getMySQLZoneSerialSnapshot(MySQL& mysql)
 {
   MySQLZoneSerialSnapshot snapshot;
-  snapshot.readTimestamp = getMySQLUnixTimestamp(mysql);
-  const std::string query = "SELECT d.id,d.name,d.master,d.last_check,d.type,d.notified_serial,d.account,d.options,d.catalog,r.content "
+  const std::string query = "SELECT d.id,d.name,d.master,d.last_check,d.type,d.notified_serial,d.account,d.options,d.catalog,r.content,d." + std::string(ReplicationCursorColumn) + " "
                             "FROM domains d "
                             "LEFT JOIN records r ON r.domain_id=d.id AND r.name=d.name AND r.type='SOA' AND r.disabled=0 "
                             "ORDER BY d.id";
@@ -1351,7 +1352,6 @@ MySQLZoneSerialSnapshot getMySQLZoneSerialSnapshot(MySQL& mysql)
 MySQLZoneSerialSnapshot getChangedMySQLZoneSerialSnapshot(MySQL& mysql, uint64_t since)
 {
   MySQLZoneSerialSnapshot snapshot;
-  snapshot.readTimestamp = getMySQLUnixTimestamp(mysql);
   const std::string query = "SELECT d.id,d.name,d.master,d.last_check,d.type,d.notified_serial,d.account,d.options,d.catalog,r.content,d." + std::string(ReplicationCursorColumn) + " "
                             "FROM domains d "
                             "LEFT JOIN records r ON r.domain_id=d.id AND r.name=d.name AND r.type='SOA' AND r.disabled=0 "
@@ -1849,7 +1849,7 @@ SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress 
   }
 
   if (nextReplicationCursor != nullptr) {
-    *nextReplicationCursor = snapshot.readTimestamp;
+    *nextReplicationCursor = snapshot.replicationCursor;
   }
   stats.mysqlZones = snapshot.presentZones.size();
   stats.skippedMissingSOA = snapshot.skippedMissingSOA;
@@ -1885,7 +1885,7 @@ SerialScanStats runSerialDiffScan(MySQL& mysql, LMDBBackend& lmdb, uint64_t repl
   }
 
   if (nextReplicationCursor != nullptr) {
-    *nextReplicationCursor = snapshot.readTimestamp;
+    *nextReplicationCursor = snapshot.replicationCursor;
   }
   stats.mysqlZones = snapshot.presentZones.size();
   stats.skippedMissingSOA = snapshot.skippedMissingSOA;

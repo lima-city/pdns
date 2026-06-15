@@ -15,8 +15,10 @@ database into a local LMDB backend database.
 By default the tool runs as a SOA-serial polling daemon.  It first performs a
 complete SOA serial scan, then every ``--poll-interval`` seconds it reads zones
 whose ``domains.last_replicated_change_at`` value is newer than or equal to the
-last polling cursor.  The cursor intentionally overlaps the last seen MySQL
-``UNIX_TIMESTAMP()`` value so updates with the same timestamp are read again.
+last polling cursor.  The cursor is the highest
+``domains.last_replicated_change_at`` value read from the source, and it
+intentionally overlaps that value so updates with the same timestamp are read
+again.
 Every ``--full-sweep-interval`` seconds it runs another complete SOA serial scan
 to catch deleted zones, missing zones and out-of-band source changes.  Missing
 or changed zones are synchronized by rewriting the complete zone in LMDB.  Zone
