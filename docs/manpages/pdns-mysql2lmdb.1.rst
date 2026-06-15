@@ -19,10 +19,12 @@ last polling cursor.  The cursor intentionally overlaps the last seen MySQL
 ``UNIX_TIMESTAMP()`` value so updates with the same timestamp are read again.
 Every ``--full-sweep-interval`` seconds it runs another complete SOA serial scan
 to catch deleted zones, missing zones and out-of-band source changes.  Missing
-or changed zones are synchronized by atomically rewriting the complete zone in
-LMDB.  TSIG keys are refreshed and dirty LMDB environments are synced after each
-round.  The default mode does not use ``mysqlbinlog`` and does not read or write
-the replication state file.
+or changed zones are synchronized by rewriting the complete zone in LMDB.  Zone
+metadata and DNSSEC keys are committed before the records, so the local SOA
+serial only advances after the side data has already converged.  TSIG keys are
+refreshed and dirty LMDB environments are synced after each round.  The default
+mode does not use ``mysqlbinlog`` and does not read or write the replication
+state file.
 
 For benchmarking and operational checks, ``--sync-zone=ZONE`` synchronizes
 exactly one zone and exits.  ``--serial-scan`` runs one SOA-serial polling
@@ -105,11 +107,12 @@ OPTIONS
 
 --sync-zone=ZONE         Synchronize one zone from MySQL to LMDB and exit.  The
                         zone is read from a consistent MySQL snapshot and then
-                        atomically rewritten in LMDB.  The completion log
-                        includes imported record, empty-non-terminal, comment,
-                        metadata and key counts, elapsed seconds, and
-                        records per second.  This mode does not require
-                        ``mysqlbinlog`` and does not use ``--state-file``.
+                        rewritten in LMDB with records and the local SOA serial
+                        committed last.  The completion log includes imported
+                        record, empty-non-terminal, comment, metadata and key
+                        counts, elapsed seconds, and records per second.  This
+                        mode does not require ``mysqlbinlog`` and does not use
+                        ``--state-file``.
 
 --lmdb-filename=PATH     Target LMDB backend file. Defaults to ``./pdns.lmdb``.
 

@@ -1652,13 +1652,22 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap* recordDomains,
   replacement.last_check = domain.lastCheck;
   replacement.notified_serial = domain.notifiedSerial;
 
-  if (!lmdb.startTransaction(domain.name, info.id)) {
-    throw std::runtime_error("Unable to start LMDB transaction for zone '" + domain.name.toLogString() + "'");
-  }
-
-  bool recordTransactionStarted = true;
+  bool recordTransactionStarted = false;
   std::vector<uint64_t> recordIDs;
   try {
+    // Commit side data before records so the local SOA serial only advances
+    // after metadata and keys have already converged.
+    if (!lmdb.replaceDomainInfo(replacement)) {
+      throw std::runtime_error("Unable to update LMDB domain metadata for zone '" + domain.name.toLogString() + "'");
+    }
+    lmdb.replaceDomainMetadata(domain.name, metadata);
+    lmdb.replaceDomainKeys(domain.name, keys, false);
+
+    if (!lmdb.startTransaction(domain.name, info.id)) {
+      throw std::runtime_error("Unable to start LMDB transaction for zone '" + domain.name.toLogString() + "'");
+    }
+    recordTransactionStarted = true;
+
     lmdb.deleteDomainCommentsInTransaction(info.id);
     std::map<DNSName, bool> nonterm;
     forEachRecord(mysql, domain, [&](MySQLRecord record) {
@@ -1702,11 +1711,6 @@ bool syncDomain(MySQL& mysql, LMDBBackend& lmdb, RecordDomainMap* recordDomains,
     lmdb.commitTransaction();
     recordTransactionStarted = false;
 
-    if (!lmdb.replaceDomainInfo(replacement)) {
-      throw std::runtime_error("Unable to update LMDB domain metadata for zone '" + domain.name.toLogString() + "'");
-    }
-    lmdb.replaceDomainMetadata(domain.name, metadata);
-    lmdb.replaceDomainKeys(domain.name, keys, false);
     if (recordDomains != nullptr) {
       recordDomains->replaceDomain(domain.id, domain.name, recordIDs);
     }
