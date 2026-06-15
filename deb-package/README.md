@@ -3,27 +3,41 @@
 Build the package from the repository root:
 
 ```sh
+. deb-package/package.env
+
 docker build \
   -f deb-package/Dockerfile \
   --target export-stage \
   --build-arg UBUNTU_RELEASE=noble \
-  --build-arg PACKAGE_VERSION=0.1.0 \
-  --build-arg PACKAGE_ITERATION=1noble \
+  --build-arg PACKAGE_VERSION="${PACKAGE_VERSION}" \
+  --build-arg PACKAGE_ITERATION="${PACKAGE_ITERATION}~noble" \
   --output type=local,dest=deb-package/out/noble \
   .
 ```
+
+The package version is controlled in `deb-package/package.env`. Bump
+`PACKAGE_VERSION` for upstream releases and `PACKAGE_ITERATION` for packaging
+revisions of the same upstream version. The Ubuntu release suffix is appended by
+the build command as `~jammy` or `~noble`.
+
+Jenkins should use the repository `Jenkinsfile` as a Pipeline from SCM. The
+Jenkins job then no longer contains release versions; it checks out this
+repository, sources `deb-package/package.env`, builds all configured Ubuntu
+releases, and publishes the resulting packages.
 
 For a CI matrix build, pass the Ubuntu release as a build argument and write each
 release into a separate output directory:
 
 ```sh
-for release in jammy noble; do
+. deb-package/package.env
+
+for release in ${UBUNTU_RELEASES}; do
   docker build \
     -f deb-package/Dockerfile \
     --target export-stage \
     --build-arg UBUNTU_RELEASE="${release}" \
-    --build-arg PACKAGE_VERSION=0.1.0 \
-    --build-arg PACKAGE_ITERATION="1${release}" \
+    --build-arg PACKAGE_VERSION="${PACKAGE_VERSION}" \
+    --build-arg PACKAGE_ITERATION="${PACKAGE_ITERATION}~${release}" \
     --output "type=local,dest=deb-package/out/${release}" \
     .
 done

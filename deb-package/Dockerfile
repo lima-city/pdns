@@ -73,8 +73,8 @@ RUN mkdir -p /build/debian \
 
 FROM base AS pdns-mysql2lmdb
 
-ARG PACKAGE_VERSION=0.1.0
-ARG PACKAGE_ITERATION=1
+ARG PACKAGE_VERSION
+ARG PACKAGE_ITERATION
 ARG PACKAGE_MAINTAINER="trafficplex GmbH"
 
 WORKDIR /pkg
@@ -90,6 +90,8 @@ RUN chmod 0755 /pkg/usr/bin/pdns-mysql2lmdb \
   && chmod 0644 /pkg/lib/systemd/system/pdns-mysql2lmdb.service /pkg/etc/default/pdns-mysql2lmdb
 
 RUN set -eu; \
+  : "${PACKAGE_VERSION:?PACKAGE_VERSION build arg is required}"; \
+  : "${PACKAGE_ITERATION:?PACKAGE_ITERATION build arg is required}"; \
   set --; \
   while IFS= read -r dependency; do \
     [ -n "${dependency}" ] || continue; \
