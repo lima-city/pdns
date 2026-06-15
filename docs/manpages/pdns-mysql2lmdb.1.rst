@@ -12,13 +12,15 @@ DESCRIPTION
 ``pdns-mysql2lmdb`` replicates an authoritative PowerDNS Generic MySQL
 database into a local LMDB backend database.
 
-By default the tool runs as a SOA-serial polling daemon.  Every
-``--poll-interval`` seconds it reads all enabled MySQL apex SOA serials,
-compares them with the local LMDB SOA serials, synchronizes missing or changed
-zones by atomically rewriting the complete zone in LMDB, removes local zones
-that no longer exist in MySQL, refreshes TSIG keys, syncs dirty LMDB
-environments, and starts the next polling round.  The default mode does not use
-``mysqlbinlog`` and does not read or write the replication state file.
+By default the tool runs as a SOA-serial polling daemon.  It first performs a
+complete SOA serial scan, then every ``--poll-interval`` seconds it reads
+enabled MySQL apex SOA records whose ``records.change_date`` is newer than or
+equal to the last polling cursor.  The cursor intentionally overlaps the last
+seen MySQL ``UNIX_TIMESTAMP()`` value so updates with the same timestamp are
+read again.  Missing or changed zones are synchronized by atomically rewriting
+the complete zone in LMDB.  TSIG keys are refreshed and dirty LMDB environments
+are synced after each round.  The default mode does not use ``mysqlbinlog`` and
+does not read or write the replication state file.
 
 For benchmarking and operational checks, ``--sync-zone=ZONE`` synchronizes
 exactly one zone and exits.  ``--serial-scan`` runs one SOA-serial polling
@@ -46,8 +48,10 @@ REQUIREMENTS
 ------------
 
 The default SOA-serial polling mode requires that every relevant zone change
-updates that zone's apex SOA serial.  The MySQL user needs privileges to read
-the PowerDNS ``domains``, ``records``, ``comments``, ``domainmetadata``,
+updates that zone's apex SOA serial and sets the apex SOA
+``records.change_date`` column to the MySQL server's current
+``UNIX_TIMESTAMP()`` value.  The MySQL user needs privileges to read the
+PowerDNS ``domains``, ``records``, ``comments``, ``domainmetadata``,
 ``cryptokeys`` and ``tsigkeys`` tables.
 
 Legacy ``--binlog-follow`` mode additionally requires binary logging on the
@@ -110,7 +114,9 @@ OPTIONS
                         applied binlog positions in ``--binlog-follow`` mode.
 
 --poll-interval=SEC      Seconds to wait between SOA-serial polling rounds in
-                        the default daemon mode. Defaults to ``5``.
+                        the default daemon mode. After the initial complete
+                        scan, regular rounds use the apex SOA
+                        ``records.change_date`` cursor. Defaults to ``5``.
 
 --binlog-follow          Use the legacy ``mysqlbinlog``-following replication
                         mode instead of the default SOA-serial polling daemon.

@@ -208,6 +208,7 @@ struct MySQLZoneSerialSnapshot
 {
   std::vector<MySQLZoneSerial> zones;
   std::set<ZoneName> presentZones;
+  uint64_t readTimestamp{0};
   size_t skippedMissingSOA{0};
   size_t skippedInvalidSOA{0};
 };
@@ -1247,41 +1248,78 @@ std::optional<uint32_t> parseSOASerialForScan(const ZoneName& zone, const std::s
   }
 }
 
+uint64_t getMySQLUnixTimestamp(MySQL& mysql)
+{
+  const auto rows = mysql.query("SELECT UNIX_TIMESTAMP()");
+  if (rows.empty() || rows.at(0).empty() || !rows.at(0).at(0)) {
+    throw std::runtime_error("MySQL did not return UNIX_TIMESTAMP()");
+  }
+
+  const auto timestamp = parseUInt64Strict(*rows.at(0).at(0));
+  if (!timestamp) {
+    throw std::runtime_error("MySQL returned invalid UNIX_TIMESTAMP() value '" + *rows.at(0).at(0) + "'");
+  }
+  return *timestamp;
+}
+
+void appendZoneSerialFromRow(MySQLZoneSerialSnapshot& snapshot, const std::vector<std::optional<std::string>>& row, const std::string& context)
+{
+  if (auto zone = parseZoneNameFromSource(optString(row, 1), "during " + context + " presence id=" + optString(row, 0))) {
+    snapshot.presentZones.insert(*zone);
+  }
+  else {
+    return;
+  }
+
+  auto domain = parseDomainRow(row, "during " + context);
+  if (!domain) {
+    return;
+  }
+
+  const auto soaContent = optString(row, 9);
+  if (soaContent.empty()) {
+    if (handleInvalidSourceData("missing enabled apex SOA for zone '" + domain->name.toLogString() + "' during " + context)) {
+      ++snapshot.skippedMissingSOA;
+      return;
+    }
+  }
+
+  const auto serial = parseSOASerialForScan(domain->name, soaContent);
+  if (!serial) {
+    ++snapshot.skippedInvalidSOA;
+    return;
+  }
+  snapshot.zones.push_back({std::move(*domain), *serial});
+}
+
 MySQLZoneSerialSnapshot getMySQLZoneSerialSnapshot(MySQL& mysql)
 {
   MySQLZoneSerialSnapshot snapshot;
+  snapshot.readTimestamp = getMySQLUnixTimestamp(mysql);
   const std::string query = "SELECT d.id,d.name,d.master,d.last_check,d.type,d.notified_serial,d.account,d.options,d.catalog,r.content "
                             "FROM domains d "
                             "LEFT JOIN records r ON r.domain_id=d.id AND r.name=d.name AND r.type='SOA' AND r.disabled=0 "
                             "ORDER BY d.id";
 
   for (const auto& row : mysql.query(query)) {
-    if (auto zone = parseZoneNameFromSource(optString(row, 1), "during serial scan presence id=" + optString(row, 0))) {
-      snapshot.presentZones.insert(*zone);
-    }
-    else {
-      continue;
-    }
+    appendZoneSerialFromRow(snapshot, row, "serial scan");
+  }
 
-    auto domain = parseDomainRow(row, "during serial scan");
-    if (!domain) {
-      continue;
-    }
+  return snapshot;
+}
 
-    const auto soaContent = optString(row, 9);
-    if (soaContent.empty()) {
-      if (handleInvalidSourceData("missing enabled apex SOA for zone '" + domain->name.toLogString() + "' during serial scan")) {
-        ++snapshot.skippedMissingSOA;
-        continue;
-      }
-    }
+MySQLZoneSerialSnapshot getChangedMySQLZoneSerialSnapshot(MySQL& mysql, uint64_t since)
+{
+  MySQLZoneSerialSnapshot snapshot;
+  snapshot.readTimestamp = getMySQLUnixTimestamp(mysql);
+  const std::string query = "SELECT d.id,d.name,d.master,d.last_check,d.type,d.notified_serial,d.account,d.options,d.catalog,r.content,r.change_date "
+                            "FROM records r "
+                            "JOIN domains d ON d.id=r.domain_id "
+                            "WHERE r.type='SOA' AND r.disabled=0 AND r.name=d.name AND r.change_date IS NOT NULL AND r.change_date>=" + std::to_string(since) + " "
+                            "ORDER BY r.change_date,d.id";
 
-    const auto serial = parseSOASerialForScan(domain->name, soaContent);
-    if (!serial) {
-      ++snapshot.skippedInvalidSOA;
-      continue;
-    }
-    snapshot.zones.push_back({std::move(*domain), *serial});
+  for (const auto& row : mysql.query(query)) {
+    appendZoneSerialFromRow(snapshot, row, "serial diff scan");
   }
 
   return snapshot;
@@ -1726,32 +1764,8 @@ int runSyncZoneMode(MySQL& mysql, LMDBBackend& lmdb)
   return 0;
 }
 
-SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress = true)
+void syncChangedZoneSerials(MySQL& mysql, LMDBBackend& lmdb, const MySQLZoneSerialSnapshot& snapshot, SerialScanStats& stats, bool logProgress, const std::string& progressLabel)
 {
-  SerialScanStats stats;
-  MySQLZoneSerialSnapshot snapshot;
-
-  {
-    ConsistentReadTransaction transaction(mysql, "serial scan");
-    snapshot = getMySQLZoneSerialSnapshot(mysql);
-    transaction.commit();
-  }
-
-  stats.mysqlZones = snapshot.presentZones.size();
-  stats.skippedMissingSOA = snapshot.skippedMissingSOA;
-  stats.skippedInvalidSOA = snapshot.skippedInvalidSOA;
-
-  std::vector<DomainInfo> lmdbDomains;
-  lmdb.getAllDomains(&lmdbDomains, false, true);
-  for (const auto& domain : lmdbDomains) {
-    throwIfTerminationRequested();
-    if (snapshot.presentZones.count(domain.zone) == 0) {
-      logInfo("serial scan deleting stale local zone zone='" + domain.zone.toLogString() + "'");
-      lmdb.deleteDomainFromImporter(domain.zone);
-      ++stats.deletedLocalZones;
-    }
-  }
-
   for (const auto& zone : snapshot.zones) {
     throwIfTerminationRequested();
     ++stats.comparedZones;
@@ -1774,10 +1788,66 @@ SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress 
     }
 
     if (logProgress && stats.comparedZones % 1000 == 0) {
-      logInfo("serial scan progress compared_zones=" + std::to_string(stats.comparedZones) + "/" + std::to_string(snapshot.zones.size()) + " current_zones=" + std::to_string(stats.currentZones) + " synced_zones=" + std::to_string(stats.syncedZones) + " deleted_local_zones=" + std::to_string(stats.deletedLocalZones));
+      logInfo(progressLabel + " progress compared_zones=" + std::to_string(stats.comparedZones) + "/" + std::to_string(snapshot.zones.size()) + " current_zones=" + std::to_string(stats.currentZones) + " synced_zones=" + std::to_string(stats.syncedZones) + " deleted_local_zones=" + std::to_string(stats.deletedLocalZones));
+    }
+  }
+}
+
+SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress = true, uint64_t* nextChangeDateCursor = nullptr)
+{
+  SerialScanStats stats;
+  MySQLZoneSerialSnapshot snapshot;
+
+  {
+    ConsistentReadTransaction transaction(mysql, "serial scan");
+    snapshot = getMySQLZoneSerialSnapshot(mysql);
+    transaction.commit();
+  }
+
+  if (nextChangeDateCursor != nullptr) {
+    *nextChangeDateCursor = snapshot.readTimestamp;
+  }
+  stats.mysqlZones = snapshot.presentZones.size();
+  stats.skippedMissingSOA = snapshot.skippedMissingSOA;
+  stats.skippedInvalidSOA = snapshot.skippedInvalidSOA;
+
+  std::vector<DomainInfo> lmdbDomains;
+  lmdb.getAllDomains(&lmdbDomains, false, true);
+  for (const auto& domain : lmdbDomains) {
+    throwIfTerminationRequested();
+    if (snapshot.presentZones.count(domain.zone) == 0) {
+      logInfo("serial scan deleting stale local zone zone='" + domain.zone.toLogString() + "'");
+      lmdb.deleteDomainFromImporter(domain.zone);
+      ++stats.deletedLocalZones;
     }
   }
 
+  syncChangedZoneSerials(mysql, lmdb, snapshot, stats, logProgress, "serial scan");
+
+  syncTSIGKeys(mysql, lmdb);
+  lmdb.syncDirty();
+  return stats;
+}
+
+SerialScanStats runSerialDiffScan(MySQL& mysql, LMDBBackend& lmdb, uint64_t changeDateCursor, bool logProgress = true, uint64_t* nextChangeDateCursor = nullptr)
+{
+  SerialScanStats stats;
+  MySQLZoneSerialSnapshot snapshot;
+
+  {
+    ConsistentReadTransaction transaction(mysql, "serial diff scan");
+    snapshot = getChangedMySQLZoneSerialSnapshot(mysql, changeDateCursor);
+    transaction.commit();
+  }
+
+  if (nextChangeDateCursor != nullptr) {
+    *nextChangeDateCursor = snapshot.readTimestamp;
+  }
+  stats.mysqlZones = snapshot.presentZones.size();
+  stats.skippedMissingSOA = snapshot.skippedMissingSOA;
+  stats.skippedInvalidSOA = snapshot.skippedInvalidSOA;
+
+  syncChangedZoneSerials(mysql, lmdb, snapshot, stats, logProgress, "serial diff scan");
   syncTSIGKeys(mysql, lmdb);
   lmdb.syncDirty();
   return stats;
@@ -1829,12 +1899,16 @@ int runSerialPollMode(MySQL& mysql, LMDBBackend& lmdb)
   }
 
   size_t round = 0;
+  std::optional<uint64_t> changeDateCursor;
   while (!terminationRequested()) {
     ++round;
     const auto started = std::chrono::steady_clock::now();
-    const auto stats = runSerialScan(mysql, lmdb, false);
+    uint64_t nextChangeDateCursor = 0;
+    const bool initialFullScan = !changeDateCursor;
+    const auto stats = initialFullScan ? runSerialScan(mysql, lmdb, false, &nextChangeDateCursor) : runSerialDiffScan(mysql, lmdb, *changeDateCursor, false, &nextChangeDateCursor);
+    changeDateCursor = nextChangeDateCursor;
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    logSerialScanStats("serial poll round completed round=" + std::to_string(round), stats, elapsed, " next_poll_sec=" + std::to_string(intervalSeconds));
+    logSerialScanStats(std::string(initialFullScan ? "serial poll initial full scan completed round=" : "serial poll diff round completed round=") + std::to_string(round), stats, elapsed, " change_date_cursor=" + std::to_string(*changeDateCursor) + " next_poll_sec=" + std::to_string(intervalSeconds));
     trimAllocator("serial poll round completed");
 
     if (getBoolArg("once")) {
