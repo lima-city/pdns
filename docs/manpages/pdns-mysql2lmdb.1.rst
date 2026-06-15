@@ -17,10 +17,12 @@ complete SOA serial scan, then every ``--poll-interval`` seconds it reads
 enabled MySQL apex SOA records whose ``records.change_date`` is newer than or
 equal to the last polling cursor.  The cursor intentionally overlaps the last
 seen MySQL ``UNIX_TIMESTAMP()`` value so updates with the same timestamp are
-read again.  Missing or changed zones are synchronized by atomically rewriting
-the complete zone in LMDB.  TSIG keys are refreshed and dirty LMDB environments
-are synced after each round.  The default mode does not use ``mysqlbinlog`` and
-does not read or write the replication state file.
+read again.  Every ``--full-sweep-interval`` seconds it runs another complete
+SOA serial scan to catch deleted zones, missing zones and out-of-band source
+changes.  Missing or changed zones are synchronized by atomically rewriting the
+complete zone in LMDB.  TSIG keys are refreshed and dirty LMDB environments are
+synced after each round.  The default mode does not use ``mysqlbinlog`` and does
+not read or write the replication state file.
 
 For benchmarking and operational checks, ``--sync-zone=ZONE`` synchronizes
 exactly one zone and exits.  ``--serial-scan`` runs one SOA-serial polling
@@ -117,6 +119,14 @@ OPTIONS
                         the default daemon mode. After the initial complete
                         scan, regular rounds use the apex SOA
                         ``records.change_date`` cursor. Defaults to ``5``.
+
+--full-sweep-interval=SEC
+                        Seconds between complete SOA serial sweeps in the
+                        default daemon mode. A full sweep catches stale local
+                        zones, missing zones and source changes not visible via
+                        the ``records.change_date`` diff query. ``0`` disables
+                        periodic full sweeps after the initial complete scan.
+                        Defaults to ``300``.
 
 --binlog-follow          Use the legacy ``mysqlbinlog``-following replication
                         mode instead of the default SOA-serial polling daemon.

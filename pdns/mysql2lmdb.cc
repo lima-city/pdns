@@ -1893,22 +1893,34 @@ void sleepUntilNextPoll(unsigned int intervalSeconds)
 
 int runSerialPollMode(MySQL& mysql, LMDBBackend& lmdb)
 {
-  const auto intervalSeconds = static_cast<unsigned int>(::arg().asNum("poll-interval", 5));
-  if (intervalSeconds == 0) {
+  const auto configuredPollInterval = ::arg().asNum("poll-interval", 5);
+  if (configuredPollInterval <= 0) {
     throw std::runtime_error("--poll-interval must be greater than zero");
   }
+  const auto intervalSeconds = static_cast<unsigned int>(configuredPollInterval);
+  const auto configuredFullSweepInterval = ::arg().asNum("full-sweep-interval", 300);
+  if (configuredFullSweepInterval < 0) {
+    throw std::runtime_error("--full-sweep-interval must not be negative");
+  }
+  const auto fullSweepIntervalSeconds = static_cast<unsigned int>(configuredFullSweepInterval);
 
   size_t round = 0;
   std::optional<uint64_t> changeDateCursor;
+  auto lastFullSweep = std::chrono::steady_clock::time_point{};
   while (!terminationRequested()) {
     ++round;
     const auto started = std::chrono::steady_clock::now();
     uint64_t nextChangeDateCursor = 0;
     const bool initialFullScan = !changeDateCursor;
-    const auto stats = initialFullScan ? runSerialScan(mysql, lmdb, false, &nextChangeDateCursor) : runSerialDiffScan(mysql, lmdb, *changeDateCursor, false, &nextChangeDateCursor);
+    const bool periodicFullScan = !initialFullScan && fullSweepIntervalSeconds > 0 && started - lastFullSweep >= std::chrono::seconds(fullSweepIntervalSeconds);
+    const auto stats = (initialFullScan || periodicFullScan) ? runSerialScan(mysql, lmdb, false, &nextChangeDateCursor) : runSerialDiffScan(mysql, lmdb, *changeDateCursor, false, &nextChangeDateCursor);
+    if (initialFullScan || periodicFullScan) {
+      lastFullSweep = std::chrono::steady_clock::now();
+    }
     changeDateCursor = nextChangeDateCursor;
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    logSerialScanStats(std::string(initialFullScan ? "serial poll initial full scan completed round=" : "serial poll diff round completed round=") + std::to_string(round), stats, elapsed, " change_date_cursor=" + std::to_string(*changeDateCursor) + " next_poll_sec=" + std::to_string(intervalSeconds));
+    const std::string label = initialFullScan ? "serial poll initial full scan completed round=" : (periodicFullScan ? "serial poll full sweep completed round=" : "serial poll diff round completed round=");
+    logSerialScanStats(label + std::to_string(round), stats, elapsed, " change_date_cursor=" + std::to_string(*changeDateCursor) + " full_sweep_interval_sec=" + std::to_string(fullSweepIntervalSeconds) + " next_poll_sec=" + std::to_string(intervalSeconds));
     trimAllocator("serial poll round completed");
 
     if (getBoolArg("once")) {
@@ -3854,6 +3866,7 @@ void declareArguments()
   ::arg().set("state-save-interval", "Milliseconds to coalesce applied binlog transactions before saving replication state, checked when another transaction is applied") = "1000";
   ::arg().set("retry-interval", "Seconds to wait before retrying a stopped binlog stream") = "5";
   ::arg().set("poll-interval", "Seconds to wait between SOA serial polling rounds") = "5";
+  ::arg().set("full-sweep-interval", "Seconds between complete SOA serial sweeps in default polling mode; 0 disables periodic full sweeps after startup") = "300";
   ::arg().set("soa-serial-overflow", "How to handle SOA serials larger than 32 bits: reject, modulo, clamp") = "reject";
   ::arg().set("invalid-records", "How to handle invalid MySQL records: reject, skip") = "reject";
 
@@ -3921,7 +3934,7 @@ try
   if (!binlogFollowMode) {
     MySQL mysql;
     LMDBBackend lmdb;
-    logInfo("startup mysql_db='" + getArg("mysql-dbname") + "' lmdb='" + getArg("lmdb-filename") + "' defaults_file=" + std::string(getArg("mysql-defaults-file").empty() ? "no" : "yes") + " mode=serial-poll poll_interval_sec=" + std::to_string(::arg().asNum("poll-interval", 5)) + " once=" + std::string(getBoolArg("once") ? "yes" : "no"));
+    logInfo("startup mysql_db='" + getArg("mysql-dbname") + "' lmdb='" + getArg("lmdb-filename") + "' defaults_file=" + std::string(getArg("mysql-defaults-file").empty() ? "no" : "yes") + " mode=serial-poll poll_interval_sec=" + std::to_string(::arg().asNum("poll-interval", 5)) + " full_sweep_interval_sec=" + std::to_string(::arg().asNum("full-sweep-interval", 300)) + " once=" + std::string(getBoolArg("once") ? "yes" : "no"));
     return runSerialPollMode(mysql, lmdb);
   }
 
