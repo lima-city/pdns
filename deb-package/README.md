@@ -50,3 +50,18 @@ libstdc++ match the target release.
 The Dockerfile pins Meson inside the build container, because older Ubuntu
 releases can ship a Meson version that is too old for the current PowerDNS
 build files.
+
+## Runtime schema contract
+
+The default polling mode uses an extended PowerDNS MySQL schema. The `domains`
+table must contain the zone-wide replication cursor:
+
+```sql
+ALTER TABLE domains
+  ADD COLUMN last_replicated_change_at INT UNSIGNED NOT NULL DEFAULT 0,
+  ADD INDEX domains_last_replicated_change_at_idx (last_replicated_change_at, id);
+```
+
+Every zone-relevant application change must update the apex SOA serial and set
+`domains.last_replicated_change_at = UNIX_TIMESTAMP()` in the same MySQL
+transaction.

@@ -227,6 +227,8 @@ struct SerialScanStats
 
 using TableColumnMap = std::map<std::string, std::vector<std::string>>;
 
+constexpr const char* ReplicationCursorColumn = "last_replicated_change_at";
+
 struct SnapshotRestartException : public std::runtime_error
 {
   using std::runtime_error::runtime_error;
@@ -1150,6 +1152,44 @@ std::string sqlString(MySQL& mysql, const std::string& value)
   return "'" + mysql.escape(value) + "'";
 }
 
+bool mysqlColumnExists(MySQL& mysql, const std::string& table, const std::string& column)
+{
+  const auto rows = mysql.query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=" + sqlString(mysql, getArg("mysql-dbname")) +
+                                " AND TABLE_NAME=" + sqlString(mysql, table) +
+                                " AND COLUMN_NAME=" + sqlString(mysql, column));
+  if (rows.empty() || rows.at(0).empty()) {
+    return false;
+  }
+  const auto count = parseUInt64Strict(optString(rows.at(0), 0));
+  return count && *count > 0;
+}
+
+bool mysqlIndexStartsWithColumn(MySQL& mysql, const std::string& table, const std::string& column)
+{
+  const auto rows = mysql.query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=" + sqlString(mysql, getArg("mysql-dbname")) +
+                                " AND TABLE_NAME=" + sqlString(mysql, table) +
+                                " AND COLUMN_NAME=" + sqlString(mysql, column) +
+                                " AND SEQ_IN_INDEX=1");
+  if (rows.empty() || rows.at(0).empty()) {
+    return false;
+  }
+  const auto count = parseUInt64Strict(optString(rows.at(0), 0));
+  return count && *count > 0;
+}
+
+void validateSerialPollingSchema(MySQL& mysql)
+{
+  if (!mysqlColumnExists(mysql, "domains", ReplicationCursorColumn)) {
+    throw std::runtime_error("Default SOA serial polling mode requires extended MySQL schema column domains." + std::string(ReplicationCursorColumn) +
+                             "; add it and keep it updated together with every zone SOA serial change");
+  }
+
+  if (!mysqlIndexStartsWithColumn(mysql, "domains", ReplicationCursorColumn)) {
+    logWarning("no MySQL index starting with domains." + std::string(ReplicationCursorColumn) +
+               " found; regular polling may scan the domains table");
+  }
+}
+
 std::vector<ComboAddress> parsePrimaries(const std::string& master)
 {
   std::vector<ComboAddress> primaries;
@@ -1312,11 +1352,11 @@ MySQLZoneSerialSnapshot getChangedMySQLZoneSerialSnapshot(MySQL& mysql, uint64_t
 {
   MySQLZoneSerialSnapshot snapshot;
   snapshot.readTimestamp = getMySQLUnixTimestamp(mysql);
-  const std::string query = "SELECT d.id,d.name,d.master,d.last_check,d.type,d.notified_serial,d.account,d.options,d.catalog,r.content,r.change_date "
-                            "FROM records r "
-                            "JOIN domains d ON d.id=r.domain_id "
-                            "WHERE r.type='SOA' AND r.disabled=0 AND r.name=d.name AND r.change_date IS NOT NULL AND r.change_date>=" + std::to_string(since) + " "
-                            "ORDER BY r.change_date,d.id";
+  const std::string query = "SELECT d.id,d.name,d.master,d.last_check,d.type,d.notified_serial,d.account,d.options,d.catalog,r.content,d." + std::string(ReplicationCursorColumn) + " "
+                            "FROM domains d "
+                            "LEFT JOIN records r ON r.domain_id=d.id AND r.name=d.name AND r.type='SOA' AND r.disabled=0 "
+                            "WHERE d." + std::string(ReplicationCursorColumn) + " IS NOT NULL AND d." + std::string(ReplicationCursorColumn) + ">=" + std::to_string(since) + " "
+                            "ORDER BY d." + std::string(ReplicationCursorColumn) + ",d.id";
 
   for (const auto& row : mysql.query(query)) {
     appendZoneSerialFromRow(snapshot, row, "serial diff scan");
@@ -1793,7 +1833,7 @@ void syncChangedZoneSerials(MySQL& mysql, LMDBBackend& lmdb, const MySQLZoneSeri
   }
 }
 
-SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress = true, uint64_t* nextChangeDateCursor = nullptr)
+SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress = true, uint64_t* nextReplicationCursor = nullptr)
 {
   SerialScanStats stats;
   MySQLZoneSerialSnapshot snapshot;
@@ -1804,8 +1844,8 @@ SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress 
     transaction.commit();
   }
 
-  if (nextChangeDateCursor != nullptr) {
-    *nextChangeDateCursor = snapshot.readTimestamp;
+  if (nextReplicationCursor != nullptr) {
+    *nextReplicationCursor = snapshot.readTimestamp;
   }
   stats.mysqlZones = snapshot.presentZones.size();
   stats.skippedMissingSOA = snapshot.skippedMissingSOA;
@@ -1829,19 +1869,19 @@ SerialScanStats runSerialScan(MySQL& mysql, LMDBBackend& lmdb, bool logProgress 
   return stats;
 }
 
-SerialScanStats runSerialDiffScan(MySQL& mysql, LMDBBackend& lmdb, uint64_t changeDateCursor, bool logProgress = true, uint64_t* nextChangeDateCursor = nullptr)
+SerialScanStats runSerialDiffScan(MySQL& mysql, LMDBBackend& lmdb, uint64_t replicationCursor, bool logProgress = true, uint64_t* nextReplicationCursor = nullptr)
 {
   SerialScanStats stats;
   MySQLZoneSerialSnapshot snapshot;
 
   {
     ConsistentReadTransaction transaction(mysql, "serial diff scan");
-    snapshot = getChangedMySQLZoneSerialSnapshot(mysql, changeDateCursor);
+    snapshot = getChangedMySQLZoneSerialSnapshot(mysql, replicationCursor);
     transaction.commit();
   }
 
-  if (nextChangeDateCursor != nullptr) {
-    *nextChangeDateCursor = snapshot.readTimestamp;
+  if (nextReplicationCursor != nullptr) {
+    *nextReplicationCursor = snapshot.readTimestamp;
   }
   stats.mysqlZones = snapshot.presentZones.size();
   stats.skippedMissingSOA = snapshot.skippedMissingSOA;
@@ -1893,6 +1933,8 @@ void sleepUntilNextPoll(unsigned int intervalSeconds)
 
 int runSerialPollMode(MySQL& mysql, LMDBBackend& lmdb)
 {
+  validateSerialPollingSchema(mysql);
+
   const auto configuredPollInterval = ::arg().asNum("poll-interval", 5);
   if (configuredPollInterval <= 0) {
     throw std::runtime_error("--poll-interval must be greater than zero");
@@ -1905,22 +1947,22 @@ int runSerialPollMode(MySQL& mysql, LMDBBackend& lmdb)
   const auto fullSweepIntervalSeconds = static_cast<unsigned int>(configuredFullSweepInterval);
 
   size_t round = 0;
-  std::optional<uint64_t> changeDateCursor;
+  std::optional<uint64_t> replicationCursor;
   auto lastFullSweep = std::chrono::steady_clock::time_point{};
   while (!terminationRequested()) {
     ++round;
     const auto started = std::chrono::steady_clock::now();
-    uint64_t nextChangeDateCursor = 0;
-    const bool initialFullScan = !changeDateCursor;
+    uint64_t nextReplicationCursor = 0;
+    const bool initialFullScan = !replicationCursor;
     const bool periodicFullScan = !initialFullScan && fullSweepIntervalSeconds > 0 && started - lastFullSweep >= std::chrono::seconds(fullSweepIntervalSeconds);
-    const auto stats = (initialFullScan || periodicFullScan) ? runSerialScan(mysql, lmdb, false, &nextChangeDateCursor) : runSerialDiffScan(mysql, lmdb, *changeDateCursor, false, &nextChangeDateCursor);
+    const auto stats = (initialFullScan || periodicFullScan) ? runSerialScan(mysql, lmdb, false, &nextReplicationCursor) : runSerialDiffScan(mysql, lmdb, *replicationCursor, false, &nextReplicationCursor);
     if (initialFullScan || periodicFullScan) {
       lastFullSweep = std::chrono::steady_clock::now();
     }
-    changeDateCursor = nextChangeDateCursor;
+    replicationCursor = nextReplicationCursor;
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     const std::string label = initialFullScan ? "serial poll initial full scan completed round=" : (periodicFullScan ? "serial poll full sweep completed round=" : "serial poll diff round completed round=");
-    logSerialScanStats(label + std::to_string(round), stats, elapsed, " change_date_cursor=" + std::to_string(*changeDateCursor) + " full_sweep_interval_sec=" + std::to_string(fullSweepIntervalSeconds) + " next_poll_sec=" + std::to_string(intervalSeconds));
+    logSerialScanStats(label + std::to_string(round), stats, elapsed, " replication_cursor=" + std::to_string(*replicationCursor) + " cursor_column=domains." + ReplicationCursorColumn + " full_sweep_interval_sec=" + std::to_string(fullSweepIntervalSeconds) + " next_poll_sec=" + std::to_string(intervalSeconds));
     trimAllocator("serial poll round completed");
 
     if (getBoolArg("once")) {
