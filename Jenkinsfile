@@ -1,5 +1,5 @@
 pipeline {
-    agent any
+    agent { label "apt-repo" }
 
     options {
         timestamps()
